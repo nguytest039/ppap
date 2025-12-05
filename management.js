@@ -975,10 +975,18 @@ async function removeTaskFromProject(projectId, taskId) {
             return;
         }
 
+        // Update local data
         project.tasks = (project.tasks || []).filter(t => String(t.id) !== String(taskId));
         project.taskCount = project.tasks.length;
+        
+        // Refresh the project list in the background
         loadProjectList();
-        try { showProjectTasksModal(projectId); } catch (e) { }
+        
+        // Refresh only the modal content without closing/reopening the modal
+        const container = document.getElementById('projectTasksContent');
+        if (container) {
+            renderProjectTasksContent(project.tasks, projectId);
+        }
     } catch (e) {
         console.error('Error while deleting task:', e);
         alert('Error while deleting task. See console for details.');
