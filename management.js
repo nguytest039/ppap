@@ -1,19 +1,1577 @@
+const PROJECT_TASK_TABLE_LABELS = window.PROJECT_TASK_TABLE_I18N
+const DateFormatter = {
+    toAPIFormat(dateStr) {
+        if (!dateStr || dateStr === '-' || String(dateStr).toUpperCase() === 'N/A') {
+            return null;
+        }
+
+        const str = String(dateStr).trim().replace('T', ' ');
+
+        if (window.moment) {
+            const m = window.moment(
+                str,
+                [
+                    'YYYY/MM/DD',
+                    'YYYY-MM-DD',
+                    'YYYY/MM/DD HH:mm',
+                    'YYYY-MM-DD HH:mm',
+                    'YYYY/MM/DD HH:mm:ss',
+                    'YYYY-MM-DD HH:mm:ss',
+                ],
+                true
+            );
+
+            if (m && typeof m.isValid === 'function' && m.isValid()) {
+                return m.format('YYYY/MM/DD HH:mm:ss');
+            }
+        }
+
+        const parts = str.split(' ');
+        let datePart = parts[0] || '';
+        let timePart = parts[1] || '00:00:00';
+
+        datePart = datePart.substring(0, 10).replace(/-/g, '/');
+
+        const tPieces = timePart.split(':');
+        if (tPieces.length === 1) {
+            timePart = `${tPieces[0] || '00'}:00:00`;
+        } else if (tPieces.length === 2) {
+            timePart = `${tPieces[0] || '00'}:${tPieces[1] || '00'}:00`;
+        } else {
+            timePart = `${tPieces[0] || '00'}:${tPieces[1] || '00'}:${tPieces[2] || '00'}`;
+        }
+
+        return `${datePart} ${timePart}`;
+    },
+
+    toDisplayFormat(dateStr) {
+        return this.toAPIFormat(dateStr) || '-';
+    },
+};
+
+function formatDateForFilterInput(value) {
+    if (!value) return '';
+    if (typeof value.format === 'function') return value.format('YYYY/MM/DD');
+    if (value instanceof Date) {
+        const year = value.getFullYear();
+        const month = ('0' + (value.getMonth() + 1)).slice(-2);
+        const day = ('0' + value.getDate()).slice(-2);
+        return `${year}/${month}/${day}`;
+    }
+    const str = String(value).trim();
+    const normalized = str.split(' ')[0].replace(/-/g, '/');
+    return normalized;
+}
+
+function escapeHtml(input) {
+    if (input === null || input === undefined) return '';
+    return String(input)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function highlightMentions(safeText) {
+    if (!safeText) return '';
+    return safeText.replace(/(^|\s)@([A-Za-z0-9._-]+)/g, (match, prefix, handle) => {
+        return `${prefix}<span class="comment-mention">@${handle}</span>`;
+    });
+}
+
+function formatCommentContent(rawContent) {
+    const safe = escapeHtml(rawContent || '');
+    return highlightMentions(safe);
+}
+
+const MENTION_MAX_RESULTS = 8;
+
+function getMentionContext(text, caretPos) {
+    if (!text) return null;
+    const pos = typeof caretPos === 'number' ? caretPos : text.length;
+    const upto = text.slice(0, pos);
+    const atIndex = upto.lastIndexOf('@');
+    if (atIndex === -1) return null;
+    if (atIndex > 0) {
+        const prev = upto.charAt(atIndex - 1);
+        if (!/\s/.test(prev)) return null;
+    }
+    const query = upto.slice(atIndex + 1);
+    if (/\s/.test(query)) return null;
+    return {start: atIndex, end: pos, query};
+}
+
+function getMentionInsertValue(user) {
+    if (!user) return '';
+    const idCard = String(user.idCard || '').trim();
+    if (idCard) return idCard;
+    const displayName = String(user.displayName || '').trim();
+    if (displayName) return displayName;
+    const fullName = String(user.fullName || '').trim();
+    return fullName;
+}
+
+function initCommentMentionAutocomplete() {
+    const input = document.getElementById('input-comment');
+    if (!input) return;
+    if (input.dataset.mentionBound === '1') return;
+    input.dataset.mentionBound = '1';
+
+    const wrapper = input.closest('.comment-input') || input.parentElement;
+    if (!wrapper) return;
+
+    if (!USERS_CACHE || USERS_CACHE.length === 0) {
+        fetchUsers()
+            .then((users) => {
+                if (Array.isArray(users)) USERS_CACHE = users;
+            })
+            .catch(() => {});
+    }
+
+    let dropdown = wrapper.querySelector('.mention-suggestions');
+    if (!dropdown) {
+        dropdown = document.createElement('div');
+        dropdown.className = 'mention-suggestions';
+        wrapper.appendChild(dropdown);
+    }
+
+    const state = {matches: [], activeIndex: -1, context: null};
+
+    const hide = () => {
+        dropdown.classList.remove('active');
+        dropdown.innerHTML = '';
+        state.matches = [];
+        state.activeIndex = -1;
+        state.context = null;
+    };
+
+    const positionDropdown = () => {
+        dropdown.style.left = `${input.offsetLeft}px`;
+        dropdown.style.width = `${input.offsetWidth}px`;
+    };
+
+    const setActive = (index) => {
+        const items = dropdown.querySelectorAll('.mention-suggestion-item');
+        items.forEach((el, idx) => {
+            el.classList.toggle('is-active', idx === index);
+        });
+        state.activeIndex = index;
+    };
+
+    const selectByIndex = (index) => {
+        const user = state.matches[index];
+        const mentionValue = getMentionInsertValue(user);
+        if (!mentionValue || !state.context) return;
+        const value = input.value || '';
+        const before = value.slice(0, state.context.start);
+        const after = value.slice(state.context.end);
+        const insertText = `@${mentionValue} `;
+        input.value = `${before}${insertText}${after}`;
+        const newPos = before.length + insertText.length;
+        input.setSelectionRange(newPos, newPos);
+        hide();
+        input.focus();
+    };
+
+    const renderEmpty = () => {
+        positionDropdown();
+        dropdown.innerHTML = '<div class="mention-suggestion-empty">No users found</div>';
+        dropdown.classList.add('active');
+        state.activeIndex = -1;
+    };
+
+    const renderList = (matches) => {
+        positionDropdown();
+        dropdown.innerHTML = matches
+            .map((user, idx) => {
+                const idCard = String(user.idCard || '').trim();
+                const displayName = String(user.displayName || '').trim();
+                const fullName = String(user.fullName || '').trim();
+                const nameLine = idCard
+                    ? `@${escapeHtml(idCard)}${displayName ? ' - ' + escapeHtml(displayName) : ''}`
+                    : escapeHtml(displayName || fullName);
+                const metaLine =
+                    fullName && fullName !== displayName ? `<div class="mention-suggestion-meta">${escapeHtml(fullName)}</div>` : '';
+                return `
+                    <div class="mention-suggestion-item" data-index="${idx}">
+                        <div class="mention-suggestion-name">${nameLine}</div>
+                        ${metaLine}
+                    </div>`;
+            })
+            .join('');
+        dropdown.classList.add('active');
+        setActive(0);
+
+        dropdown.querySelectorAll('.mention-suggestion-item').forEach((item) => {
+            item.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                const index = Number(item.dataset.index || 0);
+                selectByIndex(index);
+            });
+            item.addEventListener('mouseenter', () => {
+                const index = Number(item.dataset.index || 0);
+                setActive(index);
+            });
+        });
+    };
+
+    const updateSuggestions = () => {
+        const value = input.value || '';
+        const caret = typeof input.selectionStart === 'number' ? input.selectionStart : value.length;
+        const context = getMentionContext(value, caret);
+        if (!context || !context.query || context.query.length < 1) {
+            hide();
+            return;
+        }
+
+        const matches = filterUsers(context.query).slice(0, MENTION_MAX_RESULTS);
+        state.matches = matches;
+        state.context = context;
+
+        if (!matches.length) {
+            renderEmpty();
+            return;
+        }
+
+        renderList(matches);
+    };
+
+    const onKeydown = (e) => {
+        if (!dropdown.classList.contains('active')) return;
+        if (!state.matches.length) {
+            if (e.key === 'Escape') hide();
+            return;
+        }
+
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            const next = (state.activeIndex + 1) % state.matches.length;
+            setActive(next);
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            const prev = (state.activeIndex - 1 + state.matches.length) % state.matches.length;
+            setActive(prev);
+        } else if (e.key === 'Enter' || e.key === 'Tab') {
+            e.preventDefault();
+            const index = state.activeIndex >= 0 ? state.activeIndex : 0;
+            selectByIndex(index);
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            hide();
+        }
+    };
+
+    input.addEventListener('input', updateSuggestions);
+    input.addEventListener('click', updateSuggestions);
+    input.addEventListener('keydown', onKeydown);
+    input.addEventListener('blur', () => {
+        setTimeout(hide, 150);
+    });
+
+    if (!input._mentionDocHandler) {
+        input._mentionDocHandler = function (e) {
+            if (!wrapper.contains(e.target)) hide();
+        };
+        document.addEventListener('click', input._mentionDocHandler);
+    }
+}
+
+let USERS_CACHE = [];
+
+async function fetchUsers() {
+    try {
+        const res = await fetch('/ppap-system/api/users');
+        if (!res.ok) {
+            throw new Error(`Failed to fetch users: ${res.status} ${res.statusText}`);
+        }
+        const json = await res.json();
+        return json.result || [];
+    } catch (error) {
+        console.error('Error fetching users:', error);
+        return [];
+    }
+}
+
+function filterUsers(keyword) {
+    if (!keyword || keyword.length === 0) {
+        return USERS_CACHE;
+    }
+
+    const lowerKeyword = keyword.toLowerCase();
+    return USERS_CACHE.filter((user) => {
+        const idCard = (user.idCard || '').toLowerCase();
+        const fullName = (user.fullName || '').toLowerCase();
+        const displayName = (user.displayName || '').toLowerCase();
+
+        return idCard.includes(lowerKeyword) || fullName.includes(lowerKeyword) || displayName.includes(lowerKeyword);
+    });
+}
+
+function formatUserLabel(user) {
+    if (!user) return '';
+    const idCard = (user.idCard || '').trim();
+    const displayName = (user.displayName || '').trim();
+    if (!idCard && !displayName) return '';
+    return displayName ? `${idCard} - ${displayName}` : idCard;
+}
+
+function getUserLabelById(idCard) {
+    if (!idCard) return '';
+    const normalized = String(idCard).trim();
+    const found = USERS_CACHE.find((user) => (user.idCard || '').toString() === normalized);
+    if (found) return formatUserLabel(found);
+    return normalized;
+}
+
+function normalizeStatus(status) {
+    if (!status) return '';
+    return String(status).trim().toUpperCase().replace(/\s+/g, '_').replace(/-/g, '_');
+}
+
+function getStatusBadgeClass(status) {
+    const normalized = normalizeStatus(status);
+    const statusMap = {
+        OPEN: 'status-pending',
+        PENDING: 'status-gray',
+        IN_PROGRESS: 'status-in-progress',
+        WAITING_FOR_APPROVAL: 'status-waiting',
+        COMPLETED: 'status-completed',
+        OVERDUE: 'status-overdue',
+        IN_PROCESS: 'status-in-progress',
+        OVER_DUE: 'status-overdue',
+        CREATED: 'status-na',
+        RETURNED: 'status-overdue',
+        ON_GOING: 'status-pending',
+        CLOSED: 'status-completed',
+    };
+    return statusMap[normalized] || 'status-na';
+}
+
+function getStatusLabel(status) {
+    const normalized = normalizeStatus(status);
+    if (!normalized) return 'N/A';
+    return normalized.replace(/_/g, ' ');
+}
+
+function getPriorityBadgeClass(priority) {
+    if (!priority) return 'priority-medium';
+    const p = priority.toLowerCase();
+    return `priority-${p}`;
+}
+
+function getPriorityLabel(priority) {
+    if (!priority) return 'MEDIUM';
+    return priority.replace(/_/g, ' ');
+}
+
+function populateDriSelectOptions(selectEl, selectedValue) {
+    if (!selectEl) return;
+
+    selectEl.innerHTML = '<option value="">-- Select DRI --</option>';
+
+    USERS_CACHE.forEach((user) => {
+        const idCard = user.idCard || '';
+        const fullName = user.fullName || '';
+        const displayName = user.displayName || '';
+        const option = document.createElement('option');
+        option.value = idCard;
+        option.textContent = formatUserLabel(user);
+        if (selectedValue && idCard === selectedValue) {
+            option.selected = true;
+        }
+        selectEl.appendChild(option);
+    });
+}
+
+function initDriSelect2(selectEl, dropdownParent) {
+    if (!selectEl || !window.jQuery || typeof $.fn.select2 !== 'function') {
+        return;
+    }
+
+    let targetEl = selectEl;
+    if (selectEl.tagName === 'INPUT') {
+        const currentVal = selectEl.value || '';
+        const newSelect = document.createElement('select');
+        newSelect.id = selectEl.id;
+        newSelect.className = selectEl.className;
+        newSelect.name = selectEl.name || selectEl.id;
+
+        if (selectEl.dataset) {
+            Object.keys(selectEl.dataset).forEach((key) => {
+                newSelect.dataset[key] = selectEl.dataset[key];
+            });
+        }
+
+        selectEl.parentNode.replaceChild(newSelect, selectEl);
+        targetEl = newSelect;
+
+        populateDriSelectOptions(targetEl, currentVal);
+    } else {
+        const currentVal = selectEl.value || '';
+        populateDriSelectOptions(targetEl, currentVal);
+    }
+
+    const $select = $(targetEl);
+
+    if ($select.data('select2')) {
+        try {
+            $select.select2('destroy');
+        } catch (e) {}
+    }
+
+    $select.select2({
+        placeholder: 'Search user...',
+        allowClear: true,
+        width: '100%',
+        language: {
+            noResults: function (params) {
+                const term = params && params.term ? String(params.term).trim() : '';
+                if (!term) return 'No results found';
+                return `No results found; Press Enter to add ${term}`;
+            },
+        },
+        dropdownParent: dropdownParent ? $(dropdownParent) : $select.parent(),
+    });
+
+    const savedVal = targetEl.value || (selectEl !== targetEl ? selectEl.value : '') || '';
+    if (savedVal) {
+        $select.val(savedVal).trigger('change.select2');
+    }
+
+    const updateNoResultsMessage = function (searchValue) {
+        const term = searchValue ? String(searchValue).trim() : '';
+        const messageEl = document.querySelector('.select2-container--open .select2-results__message');
+        if (!messageEl) return;
+        if (!term) {
+            messageEl.textContent = 'No results found';
+            return;
+        }
+        messageEl.textContent = `No results found; Press Enter to add ${term}`;
+    };
+
+    $select.off('select2:open.ppapDri');
+    $select.on('select2:open.ppapDri', function () {
+        const searchField = document.querySelector('.select2-container--open .select2-search__field');
+        if (!searchField) return;
+
+        if (searchField._ppapDriEnterHandler) {
+            searchField.removeEventListener('keydown', searchField._ppapDriEnterHandler);
+        }
+        if (searchField._ppapDriInputHandler) {
+            searchField.removeEventListener('input', searchField._ppapDriInputHandler);
+        }
+
+        searchField._ppapDriEnterHandler = async function (ev) {
+            if (ev.key !== 'Enter') return;
+            const term = (searchField.value || '').trim();
+            if (!term) return;
+
+            const exists = USERS_CACHE.some((user) => String(user.idCard || '').trim() === term);
+            if (exists) return;
+
+            ev.preventDefault();
+
+            try {
+                const res = await fetch(
+                    `/ppap-system/api/users/get-dri?idCard=${encodeURIComponent(term)}`
+                );
+                if (!res.ok) {
+                    console.error('get-dri failed:', res.status, res.statusText);
+                    return;
+                }
+
+                const json = await res.json();
+                const user = json.data || json.result || null;
+                if (!user) return;
+
+                const idCard = String(user.idCard || term).trim();
+                const found = USERS_CACHE.some((u) => String(u.idCard || '').trim() === idCard);
+                if (!found) USERS_CACHE.push(user);
+
+                populateDriSelectOptions(targetEl, idCard);
+                $select.val(idCard).trigger('change.select2');
+                $select.select2('close');
+            } catch (e) {
+                console.error('get-dri error:', e);
+            }
+        };
+
+        searchField._ppapDriInputHandler = function () {
+            updateNoResultsMessage(searchField.value || '');
+        };
+
+        searchField.addEventListener('keydown', searchField._ppapDriEnterHandler);
+        searchField.addEventListener('input', searchField._ppapDriInputHandler);
+        updateNoResultsMessage(searchField.value || '');
+    });
+}
+
+async function loadUsersAndInitDriSelects() {
+    if (USERS_CACHE.length === 0) {
+        USERS_CACHE = await fetchUsers();
+    }
+
+    const filterCreatedBy = document.getElementById('filter-created-by');
+    if (filterCreatedBy) {
+        initDriSelect2(filterCreatedBy, null);
+    }
+}
+
+function initCustomDriSelect2() {
+    const customDri = document.getElementById('custom-dri');
+    const modal = document.getElementById('customTaskModal');
+    if (customDri && modal) {
+        initDriSelect2(customDri, modal);
+    }
+}
+
+function initTaskDetailDriSelect2() {
+    const driInput = document.getElementById('dri');
+    const modal = document.getElementById('taskDetailModal');
+    if (driInput && modal) {
+        initDriSelect2(driInput, modal);
+    }
+}
+
+function safeCompareIds(id1, id2) {
+    if (id1 == null || id2 == null) {
+        return id1 === id2;
+    }
+
+    const str1 = String(id1);
+    const str2 = String(id2);
+    if (str1 === 'null' || str1 === 'undefined' || str2 === 'null' || str2 === 'undefined') {
+        return false;
+    }
+
+    return str1 === str2;
+}
+
+function findProjectById(projectId) {
+    if (!projectId) return null;
+    return projectList.find((p) => safeCompareIds(p.id, projectId)) || null;
+}
+
+const Validators = {
+    required(value, fieldName) {
+        const val = value ? String(value).trim() : '';
+        if (!val) {
+            throw new Error(`${fieldName} is required`);
+        }
+        return val;
+    },
+
+    maxLength(value, max, fieldName) {
+        if (String(value).length > max) {
+            throw new Error(`${fieldName} must be less than ${max} characters`);
+        }
+        return value;
+    },
+};
+
+function openModal(modalId) {
+    const modalEl = typeof modalId === 'string' ? document.getElementById(modalId) : modalId;
+    if (!modalEl) {
+        return null;
+    }
+
+    try {
+        const modal = new bootstrap.Modal(modalEl);
+        modal.show();
+        return modal;
+    } catch (e) {
+        modalEl.classList.add('active');
+        return null;
+    }
+}
+
+function safeHideModal(modalEl) {
+    if (!modalEl) return;
+    try {
+        if (window.bootstrap && bootstrap.Modal) {
+            const inst = bootstrap.Modal.getInstance(modalEl);
+            if (inst && typeof inst.hide === 'function') {
+                inst.hide();
+            } else {
+                try {
+                    new bootstrap.Modal(modalEl).hide();
+                } catch (e) {
+                    modalEl.classList.remove('show', 'active');
+                }
+            }
+        } else {
+            modalEl.classList.remove('show', 'active');
+        }
+    } catch (e) {
+        try {
+            modalEl.classList.remove('show', 'active');
+        } catch (e2) {}
+    }
+    setTimeout(() => {
+        try {
+            const openModals = document.querySelectorAll('.modal.show');
+            const backdrops = document.querySelectorAll('.modal-backdrop');
+
+            if (backdrops.length > openModals.length) {
+                for (let i = openModals.length; i < backdrops.length; i++) {
+                    if (backdrops[i] && backdrops[i].parentNode) {
+                        backdrops[i].parentNode.removeChild(backdrops[i]);
+                    }
+                }
+            }
+
+            if (openModals.length === 0) {
+                document.body.classList.remove('modal-open');
+                document.body.style.paddingRight = '';
+                document.body.style.overflow = '';
+            }
+        } catch (e) {}
+    }, 150);
+}
+
+function cleanUpModal() {
+    try {
+        const openModals = document.querySelectorAll('.modal.show');
+        const anyOpen = openModals.length > 0;
+
+        if (!anyOpen) {
+            const backdrops = document.querySelectorAll('.modal-backdrop');
+            backdrops.forEach((b) => {
+                try {
+                    if (b && b.parentNode) {
+                        b.parentNode.removeChild(b);
+                    }
+                } catch (e) {}
+            });
+            try {
+                document.body.classList.remove('modal-open');
+                document.body.style.paddingRight = '';
+                document.body.style.overflow = '';
+            } catch (e) {}
+        } else {
+            try {
+                const backdrops = Array.from(document.querySelectorAll('.modal-backdrop'));
+                const openCount = openModals.length;
+
+                if (backdrops.length > openCount) {
+                    for (let i = openCount; i < backdrops.length; i++) {
+                        try {
+                            if (backdrops[i] && backdrops[i].parentNode) {
+                                backdrops[i].parentNode.removeChild(backdrops[i]);
+                            }
+                        } catch (e) {}
+                    }
+                }
+            } catch (e) {}
+        }
+    } catch (e) {}
+}
+
+document.addEventListener('hidden.bs.modal', function (ev) {
+    setTimeout(() => {
+        cleanUpModal();
+    }, 10);
+});
+
+function getFollowButton(modalRoot) {
+    if (!modalRoot) return null;
+    return modalRoot.querySelector('.follow-btn');
+}
+
+function setFollowButtonState(btn, isFollowing) {
+    if (!btn) return;
+    const icon = btn.querySelector('i');
+    if (icon) {
+        icon.className = isFollowing ? 'bi bi-star-fill' : 'bi bi-star';
+    }
+    btn.classList.toggle('is-following', !!isFollowing);
+    btn.dataset.following = isFollowing ? '1' : '0';
+
+    const labelSpan = btn.querySelector('span:last-child');
+    if (labelSpan) {
+        const followLabel = (btn.dataset.followLabel || labelSpan.textContent || 'Follow').trim();
+        if (!btn.dataset.followLabel) btn.dataset.followLabel = followLabel;
+        if (!btn.dataset.unfollowLabel) btn.dataset.unfollowLabel = 'Unfollow';
+        labelSpan.textContent = isFollowing ? btn.dataset.unfollowLabel : btn.dataset.followLabel;
+    }
+}
+
+async function fetchFollowStatus(taskId) {
+    if (!taskId) return null;
+    try {
+        const res = await fetch(`/ppap-system/api/tasks/${encodeURIComponent(taskId)}/follower`);
+        if (!res.ok) return null;
+        const json = await res.json();
+        const value = json.result !== undefined ? json.result : json.data;
+        if (typeof value === 'boolean') return value;
+        if (value === 1 || value === '1') return true;
+        if (value === 0 || value === '0') return false;
+        return Boolean(value);
+    } catch (e) {
+        console.warn('fetchFollowStatus failed', e);
+        return null;
+    }
+}
+
+async function syncFollowButtonState(taskId, modalRoot) {
+    const btn = getFollowButton(modalRoot || document.getElementById('taskDetailModal'));
+    if (!btn) return;
+    const isFollowing = await fetchFollowStatus(taskId);
+    if (isFollowing === null) return;
+    setFollowButtonState(btn, isFollowing);
+}
+
+window.toggleFollow = async function () {
+    const modalRoot = document.getElementById('taskDetailModal');
+    const taskId = modalRoot ? modalRoot.dataset.taskId : null;
+    if (!taskId) return;
+
+    const btn = getFollowButton(modalRoot);
+    const isFollowing = btn ? btn.classList.contains('is-following') : false;
+    const action = isFollowing ? 'unfollow' : 'follow';
+
+    if (btn) btn.disabled = true;
+
+    try {
+        const res = await fetch(`/ppap-system/api/tasks/${encodeURIComponent(taskId)}/${action}`, {
+            method: 'POST',
+        });
+        if (!res.ok) {
+            const message = await getApiErrorMessage(res, `${action} API returned ${res.status}`);
+            showAlertError('Failed', message);
+            return;
+        }
+
+        setFollowButtonState(btn, !isFollowing);
+        showAlertSuccess('Success', isFollowing ? 'Task unfollowed' : 'Task followed');
+    } catch (e) {
+        console.error('toggleFollow error', e);
+        showAlertError('Failed', 'Failed to update follow status');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+};
+
+function showAlertSuccess(title, text) {
+    Swal.fire({
+        title: title,
+        text: text,
+        icon: 'success',
+        customClass: 'swal-success',
+        buttonsStyling: true,
+    });
+}
+
+function showAlertError(title, text) {
+    Swal.fire({
+        title: title,
+        text: text,
+        icon: 'error',
+        customClass: 'swal-error',
+        buttonsStyling: true,
+    });
+}
+
+function showAlertWarning(title, text) {
+    Swal.fire({
+        title: title,
+        text: text,
+        icon: 'warning',
+        customClass: 'swal-warning',
+        buttonsStyling: true,
+    });
+}
+
+function extractApiMessage(payload) {
+    if (!payload) return '';
+    if (typeof payload === 'string') return payload.trim();
+
+    const pick = (value) => (typeof value === 'string' && value.trim() ? value.trim() : '');
+    const direct =
+        pick(payload.message) ||
+        pick(payload.error) ||
+        pick(payload.errorMessage) ||
+        pick(payload.msg) ||
+        pick(payload.detail);
+    if (direct) return direct;
+
+    if (payload.result && typeof payload.result === 'object') {
+        const nested =
+            pick(payload.result.message) ||
+            pick(payload.result.error) ||
+            pick(payload.result.errorMessage) ||
+            pick(payload.result.msg);
+        if (nested) return nested;
+    }
+
+    if (payload.data && typeof payload.data === 'object') {
+        const nested =
+            pick(payload.data.message) ||
+            pick(payload.data.error) ||
+            pick(payload.data.errorMessage) ||
+            pick(payload.data.msg);
+        if (nested) return nested;
+    }
+
+    if (Array.isArray(payload.errors)) {
+        const parts = payload.errors
+            .map((item) => {
+                if (typeof item === 'string') return item.trim();
+                if (item && typeof item === 'object') {
+                    return pick(item.message) || pick(item.error) || pick(item.msg);
+                }
+                return '';
+            })
+            .filter(Boolean);
+        if (parts.length) return parts.join(', ');
+    }
+
+    if (payload.errors && typeof payload.errors === 'object') {
+        const parts = Object.values(payload.errors)
+            .map((item) => (typeof item === 'string' ? item.trim() : ''))
+            .filter(Boolean);
+        if (parts.length) return parts.join(', ');
+    }
+
+    return '';
+}
+
+async function getApiErrorMessage(res, fallback) {
+    const fallbackMsg = fallback || (res && res.status ? `Request failed (${res.status})` : 'Request failed');
+
+    if (!res) return fallbackMsg;
+
+    try {
+        const contentType = res.headers && res.headers.get ? res.headers.get('content-type') || '' : '';
+        if (contentType.includes('application/json')) {
+            const json = await res.json();
+            const message = extractApiMessage(json);
+            return message || fallbackMsg;
+        }
+
+        const text = await res.text();
+        if (text && text.trim()) return text.trim();
+    } catch (e) {}
+
+    return fallbackMsg;
+}
+
+async function handleTaskFileUpload() {
+    const modal = document.getElementById('taskDetailModal');
+    if (!modal) return;
+
+    const taskId = modal.dataset.taskId;
+    if (!taskId || taskId === 'null') {
+        return;
+    }
+
+    const oldInput = modal.querySelector('input[type="file"][data-task-upload]');
+    if (oldInput) oldInput.remove();
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.multiple = true;
+    fileInput.style.display = 'none';
+    fileInput.dataset.taskUpload = 'true';
+    modal.appendChild(fileInput);
+
+    fileInput.onchange = async function () {
+        if (!fileInput.files || fileInput.files.length === 0) return;
+
+        const formData = new FormData();
+        formData.append('id', taskId);
+
+        for (let i = 0; i < fileInput.files.length; i++) {
+            formData.append('files', fileInput.files[i]);
+        }
+
+        try {
+            const res = await fetch('/ppap-system/api/tasks/upload-files', {
+                method: 'POST',
+                body: formData,
+            });
+
+            if (!res.ok) {
+                const message = await getApiErrorMessage(res, `Upload failed (${res.status})`);
+                Swal.fire({
+                    title: 'Failed',
+                    text: message,
+                    icon: 'error',
+                    background: 'var(--alert)',
+                    color: 'white',
+                    confirmButtonColor: '#3949ab',
+                    confirmButtonText: 'OK',
+                    customClass: {
+                        confirmButton: 'text-white',
+                    },
+                });
+                return;
+            }
+
+            const json = await res.json();
+
+            showAlertSuccess('Success', 'Success!');
+
+            try {
+                await fetchAndRenderAttachments(taskId);
+            } catch (e) {}
+        } catch (e) {}
+    };
+
+    fileInput.click();
+}
+
+async function handleTaskComment() {
+    const modal = document.getElementById('taskDetailModal');
+    if (!modal) return;
+
+    const taskId = modal.dataset.taskId;
+    if (!taskId || taskId === 'null') {
+        return;
+    }
+
+    const input = document.getElementById('input-comment');
+    const comment = input ? (input.value || '').trim() : '';
+    if (!comment) {
+        showAlertWarning('Warning', 'Please enter a comment');
+        return;
+    }
+
+    try {
+        const params = new URLSearchParams();
+        params.append('comment', comment);
+
+        const res = await fetch(`/ppap-system/api/tasks/${taskId}/comment`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: params.toString(),
+        });
+
+        if (!res.ok) {
+            const message = await getApiErrorMessage(res, `Failed: (${res.status})`);
+            showAlertError('Failed', message);
+            return;
+        }
+
+        let json = null;
+        try {
+            json = await res.json();
+        } catch (e) {}
+
+        showAlertSuccess('Success', 'Comment sent');
+        if (input) input.value = '';
+
+        try {
+            await getComments(taskId);
+        } catch (e) {}
+    } catch (e) {
+        showAlertError('Error', 'Error sending comment: ' + e.message);
+    }
+}
+
+async function getComments(id) {
+    try {
+        const container = document.getElementById('comment-container');
+        if (!container) return;
+
+        container.innerHTML = '<div class="comment-loading">Loading comments...</div>';
+
+        const res = await fetch(`/ppap-system/api/tasks/${id}/comments`);
+        if (!res.ok) {
+            container.innerHTML = '<div class="comment-empty">No comments</div>';
+            return;
+        }
+
+        let json = null;
+        try {
+            json = await res.json();
+        } catch (e) {
+            json = null;
+        }
+        const items = json && Array.isArray(json.data) ? json.data : [];
+
+        if (!items || items.length === 0) {
+            container.innerHTML = '<div class="comment-empty">No comments</div>';
+            return;
+        }
+
+        const html = items
+            .map((it) => {
+                const author = it.createdBy || it.author || '-';
+                const date = it.createdAt || it.createAt || it.date || '-';
+                const content = it.content || it.cnContent || it.vnContent || '';
+                const type = it.type || 'COMMENT';
+                const safeAuthor = String(author);
+                const safeDate = String(date);
+                const safeContent = String(content);
+                const renderedContent = formatCommentContent(content);
+
+                if (type === 'LOG') {
+                    return `
+                        <div class="log-item m-0" style="display: flex; gap: 12px; margin-bottom:0; margin-left: 1rem;">
+                            <div class="log-avatar" style="flex-shrink: 0;">
+                                <div class="comment-avatar"><i class="bi bi-person"></i></div>
+                            </div>
+                            <div class="log-content" style="flex-grow: 1;">
+                                <div class="log-line-1" style="font-size: 0.9rem; margin-bottom: 4px;">
+                                    <span style="font-weight: 600; color: var(--text-primary);">${escapeHtml(
+                                        safeAuthor
+                                    )}</span>
+                                    <span>${escapeHtml(safeContent)}</span>
+                                </div>
+                                <div class="log-line-2 comment-text" style="font-size: 0.85rem;">
+                                    ${escapeHtml(safeDate)}
+                                </div>
+                            </div>
+                        </div>
+                        <hr class="comment-hr" />`;
+                }
+
+                return `
+                <div class="comment-item p-0" style="display: flex; gap: 12px; background: transparent; border: none;">
+                    <div class="comment-avatar" style="flex-shrink: 0;">
+                        <div class="comment-avatar"><i class="bi bi-person"></i></div>
+                    </div>
+                    <div class="comment-content" style="flex-grow: 1;">
+                        <div class="comment-meta" style="font-size: 0.9rem; margin-bottom: 6px;">
+                            <span style="font-weight: 600; color: var(--text-primary);">${escapeHtml(safeAuthor)}</span>
+                            <span style="margin: 0 6px; color: var(--text-secondary);">-</span>
+                            <span style="color: var(--text-secondary);">${escapeHtml(safeDate)}</span>
+                        </div>
+                        <div class="comment-item" style="display: inline-block; background: var(--secondary-bg); padding: 0.65rem; border-radius: 8px; white-space: pre-wrap;">${renderedContent}</div>
+                    </div>
+                </div>
+                <hr class="comment-hr" />`;
+            })
+            .join('');
+
+        container.innerHTML = html;
+    } catch (error) {
+        console.error('Error getting comments: ' + (error && error.message ? error.message : error));
+    }
+}
+
+function parseTaskUpdates(content) {
+    const fieldMatches = content.matchAll(/\[(\w+):/g);
+    const fields = Array.from(fieldMatches).map((m) => m[1]);
+
+    const fieldLabels = {
+        dri: 'DRI',
+        dueDate: 'Deadline',
+        status: 'Status',
+        priority: 'Priority',
+        stageId: 'Stage',
+        processId: 'Process',
+    };
+
+    const translatedFields = fields.map((f) => fieldLabels[f] || f);
+    return translatedFields.join(', ') || 'Task updated';
+}
+
+async function handleAddCustomTask() {
+    try {
+        const getVal = (id) => {
+            const el = document.getElementById(id);
+            if (!el) return null;
+            const v = (el.value || '').trim();
+            return v === '' ? null : v;
+        };
+
+        const name = Validators.required(getVal('custom-task-name'), 'Task name');
+        const taskCode = getVal('custom-task-id') || null;
+
+        Validators.maxLength(name, 200, 'Task name');
+        if (taskCode !== null) {
+            Validators.maxLength(taskCode, 50, 'Task code');
+        }
+
+        const processId = getVal('custom-sl-process') ? Number(getVal('custom-sl-process')) : null;
+        const departmentId = getVal('custom-sl-department') ? Number(getVal('custom-sl-department')) : null;
+        const typeId = getVal('custom-sl-xvt') ? Number(getVal('custom-sl-xvt')) : null;
+        const priorityRaw = getVal('custom-sl-priority');
+        const priority = priorityRaw ? priorityRaw.toUpperCase() : null;
+        const dri = getVal('custom-dri');
+        const dueDateRaw = getVal('custom-deadline');
+        const description = getVal('custom-task-description');
+
+        let dueDate = null;
+        if (dueDateRaw) {
+            dueDate = DateFormatter.toAPIFormat(dueDateRaw);
+        }
+
+        let projectId = null;
+        if (currentProject && currentProject.id) {
+            projectId = currentProject.id;
+
+            if (String(projectId).startsWith('TEMP-')) {
+                const persistedId = await ensureProjectPersisted(currentProject);
+                if (!persistedId) {
+                    showAlertError('Failed', 'Unable to save project. Please try again.');
+                    return;
+                }
+                projectId = persistedId;
+                currentProject.id = persistedId;
+            }
+        } else {
+            const pidEl = document.getElementById('pt_detail_projectId');
+            if (pidEl && pidEl.value) {
+                projectId = pidEl.value;
+            }
+        }
+
+        if (projectId !== null && projectId !== undefined && projectId !== '') {
+            projectId = Number(projectId);
+            if (isNaN(projectId) || projectId <= 0) {
+                showAlertError('Failed', 'Invalid project ID');
+                return;
+            }
+        } else {
+            showAlertError('Failed', 'Please select a project before adding a task');
+            return;
+        }
+
+        const payload = {
+            name,
+            taskCode,
+            processId,
+            departmentId,
+            typeId,
+            priority,
+            dri,
+            dueDate,
+            description,
+            isTemplate: false,
+            projectId,
+            step: null,
+            flag: true,
+            status: null,
+            stageId: typeId,
+        };
+
+        console.log('Creating custom task with payload:', payload);
+
+        const res = await fetch('/ppap-system/api/tasks/create', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+            const message = await getApiErrorMessage(res, `Failed to create task: (${res.status})`);
+            console.error('Create task failed:', res.status, message);
+            showAlertError('Failed', message);
+            return;
+        }
+
+        let newTask = null;
+        try {
+            const json = await res.json();
+            newTask = json.data || json.result || json;
+        } catch (e) {}
+        showAlertSuccess('Success', 'Task created successfully!');
+        try {
+            bootstrap.Modal.getInstance(document.getElementById('customTaskModal')).hide();
+        } catch (e) {
+            const customModal = document.getElementById('customTaskModal');
+            if (customModal) {
+                customModal.classList.remove('show', 'active');
+            }
+        }
+
+        if (newTask && newTask.id) {
+            const taskToAdd = {
+                id: newTask.id,
+                taskCode: newTask.taskCode || taskCode,
+                name: newTask.name || name,
+                description: newTask.description || description,
+                status: newTask.status || 'NEW',
+                priority: newTask.priority || priority,
+                dri: newTask.dri || dri,
+                dueDate: newTask.dueDate || dueDate,
+                deadline: newTask.dueDate || dueDate,
+                processId: newTask.processId || processId,
+                departmentId: newTask.departmentId || departmentId,
+                stageId: newTask.stageId || typeId,
+                step: 0,
+            };
+
+            selectedPPAPItems.push(taskToAdd);
+
+            const project = findProjectById(projectId);
+            if (project) {
+                project.tasks = project.tasks || [];
+                project.tasks.push(taskToAdd);
+                project.taskCount = project.tasks.length;
+
+                project.tasks.forEach((t, idx) => {
+                    if (t) t.step = idx + 1;
+                });
+
+                const projectModal = document.getElementById('projectTasksModal');
+                if (projectModal && projectModal.classList.contains('show')) {
+                    const activeStageId = getCurrentStageId(projectId);
+                    if (!activeStageId || String(activeStageId) === String(taskToAdd.stageId)) {
+                        loadProjectTasksByStage(projectId, activeStageId, {skipLoader: true});
+                    }
+                }
+            }
+
+            if (currentProject && String(currentProject.id) === String(projectId)) {
+                currentProject.tasks = currentProject.tasks || [];
+                currentProject.tasks.push(taskToAdd);
+                currentProject.taskCount = currentProject.tasks.length;
+                currentProject.tasks.forEach((t, idx) => {
+                    if (t) t.step = idx + 1;
+                });
+            }
+
+            try {
+                const createModal = document.getElementById('createProjectModal');
+                if (createModal && createModal.classList.contains('show')) {
+                    renderSelectedTasksInModal();
+                }
+            } catch (e) {}
+        }
+
+        try {
+            document.getElementById('custom-task-name').value = '';
+            document.getElementById('custom-task-id').value = '';
+            document.getElementById('custom-task-description').value = '';
+            document.getElementById('custom-sl-process').value = '';
+            document.getElementById('custom-sl-department').value = '';
+            document.getElementById('custom-sl-priority').value = '';
+            document.getElementById('custom-sl-xvt').value = '';
+            document.getElementById('custom-dri').value = '';
+            document.getElementById('custom-deadline').value = '';
+        } catch (e) {}
+
+        try {
+            await loadProjectList();
+        } catch (e) {}
+    } catch (e) {
+        console.error('handleAddCustomTask error:', e);
+        showAlertError('Error', e.message || 'An error occurred while creating the task');
+    }
+}
+
 const SELECT_CONFIGS = [
-    { id: 'ppapFilterStatus', endpoint: '/api/tasks/status' },
-    { id: 'ppapFilterPriority', endpoint: '/api/tasks/priorities' },
-    { id: 'ppapFilterCustomer', endpoint: '/api/customers' },
-    { id: 'ppapFilterModel', endpoint: '/api/models' },
-    { id: 'ppapFilterStage', endpoint: '/api/stages' },
-    { id: 'ppapFilterDepartment', endpoint: '/api/departments' },
-    { id: 'ppapFilterProcess', endpoint: '/api/processes' }
+    {id: 'ppapFilterStatus', endpoint: '/api/tasks/status'},
+    {id: 'ppapFilterPriority', endpoint: '/api/tasks/priorities'},
+    {id: 'ppapFilterCustomer', endpoint: '/api/customers'},
+    {id: 'ppapFilterModel', endpoint: '/api/models'},
+    {id: 'ppapFilterStage', endpoint: '/api/stages'},
+    {id: 'ppapFilterDepartment', endpoint: '/api/departments'},
+    {id: 'ppapFilterProcess', endpoint: '/api/processes'},
+    {id: 'ppapFilterProjectStatus', endpoint: '/api/projects/status'},
 ];
 
-// Cache for results fetched on page load so other modals can reuse without refetching
 const SELECT_CACHE = {};
+
+function getCustomersCache() {
+    const list = SELECT_CACHE['/api/customers'];
+    return Array.isArray(list) ? list : [];
+}
+
+function findCustomerFromCache(value) {
+    if (value === null || value === undefined) return null;
+    const list = getCustomersCache();
+    if (!list.length) return null;
+
+    const normalized = String(value).trim();
+    const normalizedLower = normalized.toLowerCase();
+
+    return (
+        list.find((c) => c && String(c.id).trim() === normalized) ||
+        list.find((c) => c && String(c.name || '').trim().toLowerCase() === normalizedLower)
+    );
+}
+
+function getSelectNameById(cacheKey, id) {
+    if (id === null || id === undefined || id === '') return '';
+    const list = SELECT_CACHE[cacheKey] || [];
+    const normalized = String(id).trim();
+    const match = list.find((item) => {
+        if (!item || item.id === null || item.id === undefined) return false;
+        return String(item.id).trim() === normalized;
+    });
+    if (match) {
+        return match.name || match.label || '';
+    }
+    return '';
+}
+
+const CFT_NAME_MAP_BY_CUSTOMER = {};
+async function ensureCftNameMapForCustomer(customerId) {
+    const cid = customerId !== undefined && customerId !== null ? String(customerId).trim() : '';
+    if (!cid) return null;
+    if (CFT_NAME_MAP_BY_CUSTOMER[cid]) return CFT_NAME_MAP_BY_CUSTOMER[cid];
+
+    try {
+        const res = await fetch(`/ppap-system/api/cft?customerId=${encodeURIComponent(cid)}`);
+        if (!res.ok) {
+            throw new Error(`Error: ${res.status} ${res.statusText}`);
+        }
+        const json = await res.json();
+        const items = json.data || [];
+        const map = items.reduce((acc, item) => {
+            if (!item || item.id === null || item.id === undefined) return acc;
+            acc[String(item.id).trim()] = item.name || item.label || String(item.id);
+            return acc;
+        }, {});
+        CFT_NAME_MAP_BY_CUSTOMER[cid] = map;
+        return map;
+    } catch (e) {
+        console.error('ensureCftNameMapForCustomer failed:', e);
+        CFT_NAME_MAP_BY_CUSTOMER[cid] = {};
+        return CFT_NAME_MAP_BY_CUSTOMER[cid];
+    }
+}
+
+function getStageName(stageId) {
+    return getSelectNameById('/api/stages', stageId);
+}
+
+function getProcessName(processId) {
+    return getSelectNameById('/api/processes', processId);
+}
+
+let currentStageProjectId = null;
+let currentStageId = null;
+let currentStageTasks = [];
+const PROJECT_STAGE_TABS = {};
+let currentStandardPpapStageId = null;
+let currentStandardPpapProjectId = null;
+const STANDARD_PPAP_STAGE_BY_PROJECT = {};
+
+function isTaskInStage(task, stageId) {
+    if (!task) return false;
+    if (stageId === null || stageId === undefined || stageId === '') return true;
+    return String(task.stageId) === String(stageId);
+}
+
+function getStageTasksFromList(tasks, stageId) {
+    if (!Array.isArray(tasks)) return [];
+    return tasks.filter((t) => isTaskInStage(t, stageId));
+}
+
+function getTemplateIdFromTask(task) {
+    if (!task) return null;
+    if (task.parentId != null) return String(task.parentId);
+    if (task.isTemplate) return String(task.id);
+    if (allTemplateIds && allTemplateIds.has(String(task.id))) return String(task.id);
+    return null;
+}
+
+function sortStagesByName(stages) {
+    if (!Array.isArray(stages)) return [];
+    return stages
+        .filter((s) => s && s.id !== null && s.id !== undefined)
+        .slice()
+        .sort((a, b) => {
+            const nameA = String(a.name || '').trim().toLowerCase();
+            const nameB = String(b.name || '').trim().toLowerCase();
+            return nameA.localeCompare(nameB);
+        });
+}
+
+async function fetchStagesForProject(projectId) {
+    if (!projectId) return [];
+    try {
+        const res = await fetch(`/ppap-system/api/stages?projectId=${encodeURIComponent(projectId)}`);
+        if (!res.ok) throw new Error(`Error: ${res.status} ${res.statusText}`);
+        const json = await res.json();
+        return json.data || [];
+    } catch (e) {
+        console.error('fetchStagesForProject failed:', e);
+        return [];
+    }
+}
+
+function resolveActiveStageId(projectId, stages, preferredStageId) {
+    const pid = String(projectId);
+    const hasStage = (id) => stages.some((s) => String(s.id) === String(id));
+    if (preferredStageId && hasStage(preferredStageId)) return preferredStageId;
+    const cached = PROJECT_STAGE_TABS[pid] ? PROJECT_STAGE_TABS[pid].activeStageId : null;
+    if (cached && hasStage(cached)) return cached;
+    return stages.length ? stages[0].id : null;
+}
+
+function renderProjectStageTabs(projectId, stages, activeStageId) {
+    const container = document.getElementById('projectStageTabs');
+    if (!container) return;
+
+    if (!stages || stages.length === 0) {
+        setProjectTasksActionButtonsState(false);
+        container.innerHTML = '';
+        container.style.display = 'none';
+        return;
+    }
+
+    setProjectTasksActionButtonsState(true);
+    container.style.display = 'flex';
+    const labelText =
+        (container.dataset && container.dataset.label ? String(container.dataset.label).trim() : '') || 'Stage';
+    const buttonsHtml = stages
+        .map((stage) => {
+            const isActive = String(stage.id) === String(activeStageId);
+            return `
+                <button type="button"
+                    class="stage-tab${isActive ? ' active' : ''}"
+                    data-stage-id="${stage.id}">
+                    ${escapeHtml(stage.name || '')}
+                </button>
+            `;
+        })
+        .join('');
+
+    container.innerHTML = `<span class="stage-tabs-label">${escapeHtml(labelText)}</span>${buttonsHtml}`;
+}
+
+function setProjectTasksActionButtonsState(hasStage) {
+    const ids = ['project-standard-ppap', 'project-custom-task', 'project-copy-template'];
+    ids.forEach((id) => {
+        const btn = document.getElementById(id);
+        if (!btn) return;
+        btn.disabled = !hasStage;
+        btn.style.opacity = hasStage ? '' : '0.55';
+    });
+}
+
+function setActiveStageTab(projectId, stageId) {
+    const pid = String(projectId);
+    if (!PROJECT_STAGE_TABS[pid]) PROJECT_STAGE_TABS[pid] = {};
+    PROJECT_STAGE_TABS[pid].activeStageId = stageId;
+    const container = document.getElementById('projectStageTabs');
+    if (!container) return;
+    container.querySelectorAll('.stage-tab').forEach((btn) => {
+        const isActive = String(btn.dataset.stageId) === String(stageId);
+        btn.classList.toggle('active', isActive);
+    });
+}
+
+function setCurrentStageState(projectId, stageId, tasks) {
+    currentStageProjectId = projectId ? String(projectId) : null;
+    currentStageId = stageId !== null && stageId !== undefined ? String(stageId) : null;
+    currentStageTasks = Array.isArray(tasks) ? tasks.slice() : [];
+}
+
+function getCurrentStageId(projectId) {
+    if (!projectId || !currentStageProjectId) return null;
+    return String(currentStageProjectId) === String(projectId) ? currentStageId : null;
+}
+
+function getCurrentStageTasks(projectId) {
+    if (!projectId || !currentStageProjectId) return [];
+    return String(currentStageProjectId) === String(projectId) ? currentStageTasks.slice() : [];
+}
+
+function syncProjectTasksForStage(project, stageId, stageTasks) {
+    if (!project) return;
+    const tasks = Array.isArray(stageTasks) ? stageTasks : [];
+    if (!stageId) {
+        project.tasks = tasks.slice();
+        project.taskCount = project.tasks.length;
+        return;
+    }
+
+    const stageIdStr = String(stageId);
+    const stageMap = {};
+    const stageIds = new Set();
+    tasks.forEach((t) => {
+        if (!t || t.id === null || t.id === undefined) return;
+        const idStr = String(t.id);
+        stageMap[idStr] = t;
+        stageIds.add(idStr);
+    });
+
+    const existing = Array.isArray(project.tasks) ? project.tasks : [];
+    const replaced = existing.map((t) => {
+        if (t && String(t.stageId) === stageIdStr) {
+            const updated = stageMap[String(t.id)];
+            return updated || t;
+        }
+        return t;
+    });
+
+    const cleaned = replaced.filter((t) => {
+        if (!t) return false;
+        if (String(t.stageId) !== stageIdStr) return true;
+        return stageIds.has(String(t.id));
+    });
+
+    const existingIds = new Set(cleaned.map((t) => String(t.id)));
+    tasks.forEach((t) => {
+        const idStr = String(t.id);
+        if (!existingIds.has(idStr)) cleaned.push(t);
+    });
+
+    project.tasks = cleaned;
+    project.taskCount = project.tasks.length;
+}
+
+async function loadProjectTasksByStage(projectId, stageId, options) {
+    if (!projectId) return;
+    const pid = parseInt(projectId, 10);
+    if (isNaN(pid)) return;
+    const opts = options || {};
+
+    const qs = stageId ? `?stageId=${encodeURIComponent(stageId)}` : '';
+    const url = `/ppap-system/api/project/${pid}/tasks${qs}`;
+
+    const container = document.getElementById('projectTasksContent');
+    if (container) {
+        container.innerHTML = `<div style="text-align:center;padding:20px;color:var(--text-secondary)"><i class="bi bi-hourglass-split"></i> Loading tasks...</div>`;
+    }
+
+    try {
+        if (!opts.skipLoader) loader.load();
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Status ${res.status} ${res.statusText}`);
+        const json = await res.json();
+        const tasks = Array.isArray(json.data) ? json.data : [];
+
+        setCurrentStageState(pid, stageId, tasks);
+        setActiveStageTab(pid, stageId);
+
+        const project = findProjectById(pid);
+        if (project) syncProjectTasksForStage(project, stageId, tasks);
+
+        renderProjectTasksContent(tasks, pid);
+    } catch (e) {
+        console.error('Failed to load tasks:', e);
+        if (container) {
+            container.innerHTML = `<div style="color:var(--danger);text-align:center;padding:20px"><i class="bi bi-exclamation-triangle"></i> Failed to load tasks. Please try again.</div>`;
+        }
+    } finally {
+        if (!opts.skipLoader) loader.unload();
+    }
+}
+
+async function loadProjectStagesAndTasks(projectId, preferredStageId, options) {
+    const opts = options || {};
+    const stagesRaw = await fetchStagesForProject(projectId);
+    const stages = sortStagesByName(stagesRaw);
+    if (stages.length) {
+        const existing = SELECT_CACHE['/api/stages'] || [];
+        const map = {};
+        existing.forEach((s) => {
+            if (s && s.id !== null && s.id !== undefined) map[String(s.id)] = s;
+        });
+        stages.forEach((s) => {
+            if (s && s.id !== null && s.id !== undefined) map[String(s.id)] = s;
+        });
+        SELECT_CACHE['/api/stages'] = Object.values(map);
+    }
+    const activeStageId = resolveActiveStageId(projectId, stages, preferredStageId);
+    renderProjectStageTabs(projectId, stages, activeStageId);
+    if (opts.skipTasks) return;
+    await loadProjectTasksByStage(projectId, activeStageId, {skipLoader: opts.skipLoader});
+}
 
 async function fetchOptions(endpoint) {
     try {
-        const res = await fetch(`/sample-system${endpoint}`);
+        const res = await fetch(`/ppap-system${endpoint}`);
         if (!res.ok) {
             throw new Error(`Error: ${res.status} ${res.statusText}`);
         }
@@ -29,114 +1587,190 @@ function renderOptions(selectId, items) {
     const select = document.getElementById(selectId);
     if (!select) return;
 
-    let optionsHtml = items.map(item => {
-        if (typeof item === 'string' || typeof item === 'number') {
-            return `<option value="${item}">${item}</option>`;
-        } else if (item && typeof item === 'object' && item.id && item.name) {
-            return `<option value="${item.id}">${item.name}</option>`;
-        }
-        return '';
-    }).join('');
+    const currentValue = select.value;
 
-    select.innerHTML = '<option value="">-- Select --</option>' + optionsHtml;
+    let optionsHtml = '';
+    optionsHtml += `<option value="">--Select--</option>`;
+    optionsHtml += items
+        .map((item) => {
+            if (typeof item === 'string' || typeof item === 'number') {
+                return `<option value="${item}">${item}</option>`;
+            } else if (item && typeof item === 'object' && item.id && item.name) {
+                return `<option value="${item.id}">${item.name}</option>`;
+            }
+            return '';
+        })
+        .join('');
+
+    select.innerHTML = optionsHtml;
+    if (currentValue) {
+        select.value = currentValue;
+    }
+}
+
+async function loadCftTeamsForSelect(selectId, customerId) {
+    const selectEl = document.getElementById(selectId);
+    if (!selectEl) return;
+
+    const cid = customerId ? String(customerId).trim() : '';
+    if (!cid) {
+        renderOptions(selectId, []);
+        return;
+    }
+
+    try {
+        const res = await fetch(`/ppap-system/api/cft?customerId=${encodeURIComponent(cid)}`);
+        if (!res.ok) {
+            throw new Error(`Error: ${res.status} ${res.statusText}`);
+        }
+        const json = await res.json();
+        const items = json.data || [];
+        renderOptions(selectId, items);
+        SELECT_CACHE['/api/cft'] = items;
+    } catch (error) {
+        console.error('Error calling API /api/cft:', error);
+        renderOptions(selectId, []);
+    }
 }
 
 async function loadAllSelects() {
-    const results = await Promise.all(
-        SELECT_CONFIGS.map(cfg => fetchOptions(cfg.endpoint))
-    );
+    const endpoints = Array.from(new Set(SELECT_CONFIGS.map((cfg) => cfg.endpoint)));
+    const results = await Promise.all(endpoints.map((endpoint) => fetchOptions(endpoint)));
+    const endpointResultMap = endpoints.reduce((acc, endpoint, idx) => {
+        acc[endpoint] = results[idx] || [];
+        return acc;
+    }, {});
 
-    SELECT_CONFIGS.forEach((cfg, idx) => {
-        const items = results[idx] || [];
+    SELECT_CONFIGS.forEach((cfg) => {
+        const items = endpointResultMap[cfg.endpoint] || [];
         renderOptions(cfg.id, items);
         SELECT_CACHE[cfg.endpoint] = items;
     });
 
-    try {
-        const stageCfgIndex = SELECT_CONFIGS.findIndex(c => c.endpoint === '/api/stages' || c.id === 'ppapFilterStage');
-        if (stageCfgIndex !== -1) {
-            const stages = results[stageCfgIndex] || [];
-            renderOptions('sl-xvt', stages);
-            SELECT_CACHE['/api/stages'] = stages;
-        } else {
-            const stages = await fetchOptions('/api/stages');
-            renderOptions('sl-xvt', stages);
-            SELECT_CACHE['/api/stages'] = stages;
-        }
-    } catch (e) {
-        console.warn('Failed to load stages for sl-xvt:', e);
-    }
+    const customers = endpointResultMap['/api/customers'] || [];
+    SELECT_CACHE['/api/customers'] = customers;
+    renderOptions('projectCustomerSelect', customers);
+    renderOptions('newProjectCustomer', customers);
 
     try {
-        const statusIndex = SELECT_CONFIGS.findIndex(c => c.endpoint === '/api/tasks/status' || c.id === 'ppapFilterStatus');
-        const priorityIndex = SELECT_CONFIGS.findIndex(c => c.endpoint === '/api/tasks/priorities' || c.id === 'ppapFilterPriority');
-        
+        const customerEl = document.getElementById('newProjectCustomer');
+        const customerId = customerEl ? customerEl.value : '';
+        await loadCftTeamsForSelect('newProjectCft', customerId);
+    } catch (e) {}
 
-        if (statusIndex !== -1) {
-            const statuses = results[statusIndex] || [];
-            renderOptions('sl-status', statuses);
-            SELECT_CACHE['/api/tasks/status'] = statuses;
-        } else {
-            const statuses = await fetchOptions('/api/tasks/status');
-            renderOptions('sl-status', statuses);
-            SELECT_CACHE['/api/tasks/status'] = statuses;
-        }
+    try {
+        const filterCustomerEl = document.getElementById('projectCustomerSelect');
+        const filterCustomerId = filterCustomerEl ? filterCustomerEl.value : '';
+        await loadCftTeamsForSelect('sl-cft', filterCustomerId);
+    } catch (e) {}
 
-        if (priorityIndex !== -1) {
-            const priorities = results[priorityIndex] || [];
-            renderOptions('sl-priority', priorities);
-            SELECT_CACHE['/api/tasks/priorities'] = priorities;
-        } else {
-            const priorities = await fetchOptions('/api/tasks/priorities');
-            renderOptions('sl-priority', priorities);
-            SELECT_CACHE['/api/tasks/priorities'] = priorities;
-        }
-    } catch (e) {
-        console.warn('Failed to load status/priority for selects:', e);
-    }
+    try {
+        const stages = endpointResultMap['/api/stages'] || (await fetchOptions('/api/stages'));
+        renderOptions('sl-xvt', stages);
+        SELECT_CACHE['/api/stages'] = stages;
+    } catch (e) {}
+
+    try {
+        const statuses = endpointResultMap['/api/tasks/status'] || (await fetchOptions('/api/tasks/status'));
+        renderOptions('sl-status', statuses);
+        SELECT_CACHE['/api/tasks/status'] = statuses;
+
+        try {
+            const projStatuses =
+                endpointResultMap['/api/projects/status'] || (await fetchOptions('/api/projects/status'));
+            renderOptions('ppapFilterProjectStatus', projStatuses);
+            SELECT_CACHE['/api/projects/status'] = projStatuses;
+        } catch (e) {}
+
+        const priorities =
+            endpointResultMap['/api/tasks/priorities'] || (await fetchOptions('/api/tasks/priorities'));
+        renderOptions('sl-priority', priorities);
+        SELECT_CACHE['/api/tasks/priorities'] = priorities;
+
+        try {
+            const processes = endpointResultMap['/api/processes'] || (await fetchOptions('/api/processes'));
+            renderOptions('sl-type', processes);
+            SELECT_CACHE['/api/processes'] = processes;
+        } catch (e) {}
+    } catch (e) {}
 }
 
-async function createProject(customerId, name) {
-    const c = customerId || (document.getElementById('newProjectCustomer') && document.getElementById('newProjectCustomer').value);
+async function createProject(customerId, name, product, model, cftId) {
+    const c =
+        customerId ||
+        (document.getElementById('newProjectCustomer') && document.getElementById('newProjectCustomer').value);
     const n = name || (document.getElementById('newProjectName') && document.getElementById('newProjectName').value);
+    const fallbackProduct =
+        product !== undefined && product !== null
+            ? product
+            : document.getElementById('newProjectProduct') && document.getElementById('newProjectProduct').value;
+    const normalizedProduct = fallbackProduct ? String(fallbackProduct).trim() : '';
+    const fallbackModel =
+        model !== undefined && model !== null
+            ? model
+            : document.getElementById('newProjectModel') && document.getElementById('newProjectModel').value;
+    const normalizedModel = fallbackModel ? String(fallbackModel).trim() : '';
+    const fallbackCftId =
+        cftId !== undefined && cftId !== null
+            ? cftId
+            : document.getElementById('newProjectCft') && document.getElementById('newProjectCft').value;
+    const normalizedCftId = fallbackCftId !== undefined && fallbackCftId !== null ? String(fallbackCftId).trim() : '';
 
     if (!c || !n) return null;
 
-    const payload = { customerId: mapCustomerToId(c), name: n };
+    const now = new Date();
+    const _pad = (v) => String(v).padStart(2, '0');
+    const nowStr = `${now.getFullYear()}/${_pad(now.getMonth() + 1)}/${_pad(now.getDate())} ${_pad(
+        now.getHours()
+    )}:${_pad(now.getMinutes())}:${_pad(now.getSeconds())}`;
+
+    const payload = {customerId: mapCustomerToId(c), name: n, createdAt: nowStr};
+    if (normalizedCftId) {
+        const cftAsNumber = Number(normalizedCftId);
+        payload.cftId = Number.isNaN(cftAsNumber) ? normalizedCftId : cftAsNumber;
+    }
+    if (normalizedProduct) {
+        payload.product = normalizedProduct;
+    }
+    if (normalizedModel) {
+        payload.model = normalizedModel;
+    }
 
     try {
-        const res = await fetch('/sample-system/api/projects/create', {
+        const res = await fetch('/ppap-system/api/projects/create', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
         });
 
         if (!res.ok) throw new Error(res.statusText || 'API error');
 
         try {
             const json = await res.json();
-            const returned = (json && json.data) ? json.data : (json || {});
+            const returned = json.result || json.data || json;
+            if (!returned || !returned.id) {
+                console.error('createProject: No ID in response', json);
+                return null;
+            }
 
+            const returnedCftId = returned.cftId || normalizedCftId || null;
+            const returnedProduct = returned.product || normalizedProduct || null;
+            const returnedModel = returned.model || normalizedModel || null;
             return {
-                id: returned.id || returned.projectId || ('TEMP-' + Date.now()),
+                id: returned.id,
                 customer: returned.customerId || c,
                 name: returned.name || n,
-                createdDate: returned.createdAt ? returned.createdAt.split(' ')[0] : new Date().toISOString().split('T')[0],
-                status: returned.status || 'N/A',
-                taskCount: returned.taskCount || 0,
-                tasks: []
+                cftId: returnedCftId,
+                product: returnedProduct,
+                model: returnedModel,
+                createdDate: returned.createdAt || nowStr,
+                status: returned.status || 'CREATED',
+                taskCount: 0,
+                tasks: [],
             };
         } catch (parseErr) {
-            console.warn('createProject: response had no JSON body', parseErr);
-            return {
-                id: 'TEMP-' + Date.now(),
-                customer: c,
-                name: n,
-                createdDate: new Date().toISOString().split('T')[0],
-                status: 'waiting',
-                taskCount: 0,
-                tasks: []
-            };
+            console.error('createProject: Failed to parse response', parseErr);
+            return null;
         }
     } catch (e) {
         console.error('createProject failed:', e);
@@ -144,52 +1778,199 @@ async function createProject(customerId, name) {
     }
 }
 
-async function saveTasksForProject(tasks, customerId, name) {
-    if (!Array.isArray(tasks) || tasks.length === 0) return true;
+async function saveTasksForProject(taskIds, customerId, name, projectId, stageId) {
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+        return true;
+    }
+    if (!projectId || projectId === null || projectId === undefined || String(projectId).trim() === '') {
+        console.error('saveTasksForProject: projectId is required');
+        return false;
+    }
+
+    const projectIdInt = parseInt(projectId, 10);
+    if (isNaN(projectIdInt)) {
+        console.error('saveTasksForProject: projectId must be a valid integer, got:', projectId);
+        return false;
+    }
+
     try {
-        const url = `/sample-system/api/projects/update?customerId=${encodeURIComponent(customerId)}&name=${encodeURIComponent(name)}`;
+        try {
+            if (typeof loader !== 'undefined' && loader && typeof loader.load === 'function') loader.load();
+        } catch (e) {}
+        const qs = stageId ? `?stageId=${encodeURIComponent(stageId)}` : '';
+        const url = `/ppap-system/api/projects/${projectIdInt}/update${qs}`;
+        const taskIdsPayload = taskIds.map((id) => Number(id));
         const res = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(tasks)
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(taskIdsPayload),
         });
         if (!res.ok) {
-            console.warn('saveTasksForProject: server returned', res.status, res.statusText);
+            const errorText = await res.text().catch(() => '');
+            console.error('saveTasksForProject: server returned', res.status, res.statusText, errorText);
             return false;
         }
+        const result = await res.json().catch(() => null);
+        console.log('saveTasksForProject: Success response:', result);
         return true;
     } catch (e) {
         console.error('saveTasksForProject failed', e);
         return false;
+    } finally {
+        try {
+            if (typeof loader !== 'undefined' && loader && typeof loader.unload === 'function') loader.unload();
+        } catch (e) {}
     }
 }
 
-document.addEventListener('DOMContentLoaded', loadAllSelects);
+async function ensureProjectPersisted(project) {
+    if (!project) return null;
+    const pid = project.id || project.projectId || null;
+    if (pid && String(pid).trim() !== '' && !String(pid).startsWith('TEMP-')) {
+        return pid;
+    }
+
+    try {
+        const created = await createProject(project.customer, project.name, project.product, project.model, project.cftId);
+        if (created && created.id && !String(created.id).startsWith('TEMP-')) {
+            project.id = created.id;
+            return project.id;
+        }
+    } catch (e) {}
+
+    try {
+        const params = new URLSearchParams();
+        if (project.name) params.append('projectName', project.name);
+        if (project.customer) params.append('customerId', mapCustomerToId(project.customer));
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                const res = await fetch(
+                    '/ppap-system/api/projects' + (params.toString() ? '?' + params.toString() : '')
+                );
+                if (res.ok) {
+                    const json = await res.json();
+                    const list = Array.isArray(json.data) ? json.data : Array.isArray(json) ? json : [];
+                    if (list && list.length) {
+                        const found = list.find(
+                            (p) =>
+                                String(p.name) === String(project.name) &&
+                                String(p.customerId || p.customer || '') === String(mapCustomerToId(project.customer))
+                        );
+                        if (found && found.id && !String(found.id).startsWith('TEMP-')) {
+                            project.id = found.id;
+                            return project.id;
+                        }
+                    }
+                }
+            } catch (e) {}
+            await new Promise((r) => setTimeout(r, 500));
+        }
+    } catch (e) {}
+
+    return null;
+}
 
 let currentProject = null;
 let projectList = [];
+let projectListCurrentPage = 1;
+let projectListPageSize = 10;
+let projectListTotalItems = 0;
+let projectListPaginationInstance = null;
 let selectedPPAPItems = [];
+let allTemplateIds = new Set();
 let createModalOriginalTitleHTML = null;
-// The task object currently shown in task detail modal (full payload as returned by get-by-id)
 let currentTaskDetailObj = null;
 
-// Helper: normalize customer input to numeric id expected by backend
+function rangePicker($input, fromDate, toDate) {
+    let start = null;
+    let end = null;
+    if (window.moment) {
+        try {
+            const mStart = window.moment((fromDate || '').split(' ')[0], 'YYYY/MM/DD', true);
+            if (mStart && typeof mStart.isValid === 'function' && mStart.isValid()) start = mStart;
+        } catch (e) {
+            start = null;
+        }
+
+        try {
+            const mEnd = window.moment((toDate || '').split(' ')[0], 'YYYY/MM/DD', true);
+            if (mEnd && typeof mEnd.isValid === 'function' && mEnd.isValid()) end = mEnd;
+        } catch (e) {
+            end = null;
+        }
+    }
+
+    const fallbackStart = window.moment
+        ? window.moment().subtract(3, 'months')
+        : new Date(new Date().setMonth(new Date().getMonth() - 3));
+
+    $input.daterangepicker({
+        startDate: start || fallbackStart,
+        endDate: end || (window.moment ? window.moment() : new Date()),
+        autoApply: false,
+        locale: {format: 'YYYY/MM/DD'},
+    });
+
+    const startValue = formatDateForFilterInput(start || fallbackStart);
+    const endValue = formatDateForFilterInput(end || (window.moment ? window.moment() : new Date()));
+    if (typeof $input.val === 'function' && startValue && endValue) {
+        $input.val(`${startValue} - ${endValue}`);
+    }
+}
+
+function singlePicker($input, workDate, withTime) {
+    const raw = String(workDate || '').trim();
+    let start = null;
+    if (window.moment) {
+        try {
+            const formats = withTime
+                ? ['YYYY/MM/DD HH:mm:ss', 'YYYY/MM/DD HH:mm', 'YYYY-MM-DD HH:mm:ss', 'YYYY-MM-DD HH:mm']
+                : ['YYYY/MM/DD', 'YYYY-MM-DD'];
+            const m = window.moment(raw, formats, true);
+            if (m && typeof m.isValid === 'function' && m.isValid()) start = m;
+        } catch (e) {
+            start = null;
+        }
+    }
+
+    $input.daterangepicker({
+        singleDatePicker: true,
+        startDate: start || new Date(),
+        autoApply: false,
+        timePicker: !!withTime,
+        timePicker24Hour: !!withTime,
+        timePickerSeconds: !!withTime,
+        locale: {format: withTime ? 'YYYY/MM/DD HH:mm:ss' : 'YYYY/MM/DD'},
+    });
+}
+
 function mapCustomerToId(cust) {
     if (cust === null || cust === undefined) return '';
+
+    const cached = findCustomerFromCache(cust);
+    if (cached && cached.id !== undefined && cached.id !== null) return cached.id;
+
     const s = String(cust).trim().toLowerCase();
     if (s === '1' || s === 'apollo') return 1;
     if (s === '2' || s === 'rhea') return 2;
     if (s === '3' || s === 'kronos') return 3;
-    // if it's numeric string, return as number
     const num = Number(s);
     if (!isNaN(num) && num > 0) return num;
-    // fallback: return original value (caller should validate)
     return cust;
 }
 
-function getEl(id) { return document.getElementById(id); }
-function safeSetDisplay(id, value) { const e = getEl(id); if (e && e.style) e.style.display = value; }
-function safeSetText(id, text) { const e = getEl(id); if (e) e.textContent = text; }
+function getEl(id) {
+    return document.getElementById(id);
+}
+function safeSetDisplay(id, value) {
+    const e = getEl(id);
+    if (e && e.style) e.style.display = value;
+}
+function safeSetText(id, text) {
+    const e = getEl(id);
+    if (e) e.textContent = text;
+}
 
 function getElValue(el) {
     if (!el) return '';
@@ -205,130 +1986,435 @@ function setElValue(el, value) {
     else el.textContent = value || '';
 }
 
-document.addEventListener("DOMContentLoaded", async function () {
-    await loadProjectList();
-});
-
-async function loadProjectList() {
-    const waitingBody = getEl('waitingApprovalBody') || (getEl('waitingApprovalSection') && getEl('waitingApprovalSection').querySelector('tbody')) || null;
-    const otherBody = getEl('otherProjectsBody') || (getEl('otherProjectsSection') && getEl('otherProjectsSection').querySelector('tbody')) || null;
+async function loadProjectList(page = projectListCurrentPage, size = projectListPageSize) {
+    const waitingBody =
+        getEl('waitingApprovalBody') ||
+        (getEl('waitingApprovalSection') && getEl('waitingApprovalSection').querySelector('tbody')) ||
+        null;
+    const otherBody =
+        getEl('otherProjectsBody') ||
+        (getEl('otherProjectsSection') && getEl('otherProjectsSection').querySelector('tbody')) ||
+        null;
 
     if (!waitingBody && !otherBody) {
         return;
     }
 
+    const targetPage = Number(page) || 1;
+    const targetSize = Number(size) || projectListPageSize;
+
+    projectListCurrentPage = Math.max(1, targetPage);
+    projectListPageSize = Math.max(1, targetSize);
+
+    let fetchSucceeded = false;
+    let fetchedProjects = [];
+    let fetchedTotal = projectListTotalItems;
+
     try {
-        const res = await fetch('/sample-system/api/projects');
-        if (res.ok) {
+        loader.load();
+        const params = buildProjectFilterParams();
+        params.set('page', projectListCurrentPage);
+        params.set('size', projectListPageSize);
+
+        const base = '/ppap-system/api/projects';
+        const url = params.toString() ? `${base}?${params.toString()}` : base;
+        const res = await fetch(url);
+
+        if (!res.ok) {
+            const message = await getApiErrorMessage(res, `Failed to load projects (${res.status})`);
+            showAlertError('Failed', message);
+        } else {
             const json = await res.json();
-            if (json.status === 'OK' && Array.isArray(json.data)) {
-                projectList = json.data.map(p => ({
+            const payload =
+                (json && Array.isArray(json.data) && json.data) ||
+                (json && Array.isArray(json.result) && json.result) ||
+                (Array.isArray(json) && json) ||
+                [];
+
+            fetchedTotal =
+                typeof json?.size === 'number'
+                    ? json.size
+                    : typeof json?.total === 'number'
+                    ? json.total
+                    : Array.isArray(payload)
+                    ? payload.length
+                    : 0;
+
+            if (Array.isArray(payload)) {
+                fetchedProjects = payload.map((p) => ({
                     id: p.id,
                     customer: p.customerId || 'N/A',
                     name: p.name,
-                    createdDate: p.createdAt ? p.createdAt.split(' ')[0] : '',
+                    cftId: p.cftId || '',
+                    model: p.model || '',
+                    product: p.product || '',
+                    createdBy: p.createdBy || '',
+                    createdDate: p.createdAt || '',
+                    updatedAt: p.lastUpdatedAt || '',
                     status: p.status || 'N/A',
+                    approvedBy: p.approvedBy || '',
+                    approvedAt: p.approvedAt || '',
                     taskCount: p.taskCount || 0,
-                    tasks: []
+                    tasks: [],
                 }));
+            } else {
+                fetchedProjects = [];
             }
+
+            fetchSucceeded = true;
         }
-    } catch (e) {
-        console.warn('Failed to load projects:', e);
+    } catch (error) {
+        console.error('loadProjectList failed', error);
+        showAlertError('Error', 'Failed to load project list. Please try again.');
+    } finally {
+        loader.unload();
     }
+
+    if (fetchSucceeded) {
+        projectList = fetchedProjects;
+        projectListTotalItems = fetchedTotal;
+    }
+
     renderProjectListUI();
 }
 
-function renderProjectListUI() {
-    const waitingBody = getEl('waitingApprovalBody') || (getEl('waitingApprovalSection') && getEl('waitingApprovalSection').querySelector('tbody')) || null;
-    const otherBody = getEl('otherProjectsBody') || (getEl('otherProjectsSection') && getEl('otherProjectsSection').querySelector('tbody')) || null;
+function buildProjectFilterParams() {
+    const params = new URLSearchParams();
 
-    const waitingProjects = projectList.filter(p => p.status === 'waiting');
+    try {
+        const projectName =
+            document.getElementById('ppapFilterProject') && document.getElementById('ppapFilterProject').value
+                ? document.getElementById('ppapFilterProject').value.trim()
+                : '';
+        if (projectName) params.append('projectName', projectName);
+
+        const customerId =
+            document.getElementById('projectCustomerSelect') && document.getElementById('projectCustomerSelect').value
+                ? document.getElementById('projectCustomerSelect').value.trim()
+                : '';
+        if (customerId) params.append('customerId', customerId);
+
+        const cftIdRaw =
+            document.getElementById('sl-cft') && document.getElementById('sl-cft').value
+                ? document.getElementById('sl-cft').value.trim()
+                : '';
+        if (cftIdRaw) {
+            const cftIdNum = Number(cftIdRaw);
+            params.append('cftId', Number.isNaN(cftIdNum) ? cftIdRaw : String(cftIdNum));
+        }
+
+        const product =
+            document.getElementById('sl-product') && document.getElementById('sl-product').value
+                ? document.getElementById('sl-product').value.trim()
+                : '';
+        if (product) params.append('product', product);
+
+        const model =
+            document.getElementById('filter-model') && document.getElementById('filter-model').value
+                ? document.getElementById('filter-model').value.trim()
+                : '';
+        if (model) params.append('model', model);
+
+        const createBy =
+            document.getElementById('filter-created-by') && document.getElementById('filter-created-by').value
+                ? document.getElementById('filter-created-by').value.trim()
+                : '';
+        if (createBy) params.append('createBy', createBy);
+
+        const createdDate =
+            document.getElementById('filter-created-date') && document.getElementById('filter-created-date').value
+                ? document.getElementById('filter-created-date').value.trim()
+                : '';
+        if (createdDate) {
+            const parts = createdDate
+                .split('-')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            if (parts.length === 2) {
+                let start = parts[0];
+                let end = parts[1];
+                try {
+                    if (window.moment) {
+                        const ms = window.moment(start, 'YYYY/MM/DD', true);
+                        const me = window.moment(end, 'YYYY/MM/DD', true);
+                        if (ms && ms.isValid && ms.isValid()) start = ms.format('YYYY/MM/DD');
+                        if (me && me.isValid && me.isValid()) end = me.format('YYYY/MM/DD');
+                    }
+                } catch (e) {}
+
+                const startFull = DateFormatter.toAPIFormat(start + ' 00:00:00');
+                const endFull = DateFormatter.toAPIFormat(end + ' 23:59:59');
+
+                params.append('startTime', startFull);
+                params.append('endTime', endFull);
+            }
+        }
+
+        try {
+            const projectStatusEl = document.getElementById('ppapFilterProjectStatus');
+            const projectStatus = projectStatusEl && projectStatusEl.value ? projectStatusEl.value.trim() : '';
+            if (projectStatus) params.append('status', projectStatus);
+        } catch (e) {}
+    } catch (e) {}
+
+    return params;
+}
+
+async function filterProjects() {
+    try {
+        await loadProjectList(1);
+    } catch (e) {
+        console.error('filterProjects failed', e);
+        showAlertError('Error', 'Filtering failed');
+    }
+}
+
+async function clearAdvancedFilters() {
+    try {
+        const clearBtn = document.getElementById('clear_filter_button');
+        const section = clearBtn ? clearBtn.closest('.ppap-section') : null;
+
+        if (section) {
+            const inputs = section.querySelectorAll('input, select, textarea');
+            inputs.forEach((el) => {
+                try {
+                    if (el.type === 'checkbox' || el.type === 'radio') el.checked = false;
+                    else el.value = '';
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                } catch (e) {}
+            });
+        }
+
+        const extraIds = [
+            'ppapFilterProject',
+            'projectCustomerSelect',
+            'filter-model',
+            'filter-created-by',
+            'filter-created-date',
+        ];
+
+        extraIds.forEach((id) => {
+            try {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (el.type === 'checkbox' || el.type === 'radio') el.checked = false;
+                else el.value = '';
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            } catch (e) {}
+        });
+
+        try {
+            const createdDate = document.getElementById('filter-created-date');
+            if (createdDate && window.jQuery && $(createdDate).data('daterangepicker')) {
+                $(createdDate).val('');
+                $(createdDate).trigger('change');
+            }
+        } catch (e) {}
+
+        try {
+            await loadProjectList(1);
+        } catch (e) {
+            console.error('clearAdvancedFilters load error', e);
+        }
+    } catch (e) {}
+}
+
+function renderProjectListUI() {
+    const waitingBody =
+        getEl('waitingApprovalBody') ||
+        (getEl('waitingApprovalSection') && getEl('waitingApprovalSection').querySelector('tbody')) ||
+        null;
+    const otherBody =
+        getEl('otherProjectsBody') ||
+        (getEl('otherProjectsSection') && getEl('otherProjectsSection').querySelector('tbody')) ||
+        null;
+
+    const waitingProjects = projectList.filter((p) => p.status === 'waiting');
     const otherProjects = projectList.slice();
 
     if (waitingBody) {
         if (waitingProjects.length === 0) {
             waitingBody.innerHTML = `
-                <tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 20px;">
+                <tr><td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 20px;">
                     目前沒有等待審核的專案
                 </td></tr>
             `;
         } else {
-            waitingBody.innerHTML = waitingProjects.map(project => {
-                const custName = getCustomerDisplay(project.customer);
-                return `
-                <tr data-project-id="${project.id}" data-section="waiting" onclick="showProjectTasksModal('${project.id}')" style="cursor:pointer">
-                    <td class="drag-handle"><i class="bi bi-grip-vertical"></i></td>
-                    <td>${project.id}</td>
+            waitingBody.innerHTML = waitingProjects
+                .map((project, index) => {
+                    const custName = getCustomerDisplay(project.customer);
+                    const statusBadge = getStatusBadge(project.status);
+                    return `
+                <tr data-project-id="${project.id}" data-section="waiting" onclick="showProjectTasksModal('${
+                        project.id
+                    }')" style="cursor:pointer">
+                    <td>${index + 1}</td>
                     <td>${custName}</td>
-                    <td><strong>${project.name}</strong></td>
-                    <td>${project.createdDate}</td>
-                    <td><span class="badge badge-warning">Waiting Approval</span></td>
+                    <td>${project.name}</td>
+                    <td>${project.model || 'N/A'}</td>
                     <td>
-                        <button class="action-btn-sm btn-success" onclick="event.stopPropagation(); approveProject('${project.id}')">
+                        <div class="project-status-cell">${statusBadge}</div>
+                    </td>
+                    <td>${getUserLabelById(project.createdBy)}</td>
+                    <td>${
+                        project.createdDate && typeof DateFormatter !== 'undefined'
+                            ? DateFormatter.toDisplayFormat(project.createdDate)
+                            : project.createdDate || ''
+                    }</td>
+                    <td>${
+                        project.updatedAt && typeof DateFormatter !== 'undefined'
+                            ? DateFormatter.toDisplayFormat(project.updatedAt)
+                            : project.updatedAt || ''
+                    }</td>
+                    <td>${getUserLabelById(project.approvedBy)}</td>
+                    <td>${
+                        project.approvedAt && typeof DateFormatter !== 'undefined'
+                            ? DateFormatter.toDisplayFormat(project.approvedAt)
+                            : project.approvedAt || ''
+                    }</td>
+                    <td>
+                        <button class="action-btn-sm btn-success" onclick="event.stopPropagation(); approveProject('${
+                            project.id
+                        }')">
                             <i class="bi bi-check-circle"></i> Approve
                         </button>
-                        <button class="action-btn-sm btn-danger" onclick="event.stopPropagation(); rejectProject('${project.id}')">
+                        <button class="action-btn-sm btn-danger" onclick="event.stopPropagation(); rejectProject('${
+                            project.id
+                        }')">
                             <i class="bi bi-x-circle"></i> Reject
                         </button>
-                        <button class="action-btn-sm" onclick="event.stopPropagation(); showProjectTasksModal('${project.id}')">
+                        <button class="action-btn-sm" onclick="event.stopPropagation(); showProjectTasksModal('${
+                            project.id
+                        }')">
                             <i class="bi bi-eye"></i> View
                         </button>
                     </td>
                 </tr>
-            `}).join('');
+            `;
+                })
+                .join('');
         }
     }
 
     if (otherBody) {
         if (otherProjects.length === 0) {
             otherBody.innerHTML = `
-                <tr><td colspan="6" style="text-align: center; color: var(--text-secondary); padding: 20px;">
+                <tr><td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 20px;">
                     No Data!
                 </td></tr>
             `;
         } else {
-            otherBody.innerHTML = otherProjects.map(project => {
-                const statusBadge = getStatusBadge(project.status);
-                const custName = getCustomerDisplay(project.customer);
-                return `
-                    <tr data-project-id="${project.id}" data-section="other" onclick="showProjectTasksModal('${project.id}')" style="cursor:pointer">
-                        <td class="drag-handle"><i class="bi bi-grip-vertical"></i></td>
+            otherBody.innerHTML = otherProjects
+                .map((project, index) => {
+                    const statusBadge = getStatusBadge(project.status);
+                    const custName = getCustomerDisplay(project.customer);
+                    return `
+                    <tr data-project-id="${project.id}" data-section="other" onclick="showProjectTasksModal('${
+                        project.id
+                    }')" style="cursor:pointer">
+                        <td>${index + 1}</td>
                         <td>${custName}</td>
-                        <td><strong>${project.name}</strong></td>
-                        <td>${project.createdDate}</td>
-                        <td>${statusBadge}</td>
+                        <td>${project.name}</td>
+                        <td>${project.model || 'N/A'}</td>
                         <td>
-                            <button class="action-btn-sm" onclick="event.stopPropagation(); showProjectTasksModal('${project.id}')" title="View tasks">
+                            <div class="project-status-cell">${statusBadge}</div>
+                        </td>
+                        <td>${getUserLabelById(project.createdBy)}</td>
+                        <td>${
+                            project.createdDate && typeof DateFormatter !== 'undefined'
+                                ? DateFormatter.toDisplayFormat(project.createdDate)
+                                : project.createdDate || ''
+                        }</td>
+                        <td>${
+                            project.updatedAt && typeof DateFormatter !== 'undefined'
+                                ? DateFormatter.toDisplayFormat(project.updatedAt)
+                                : project.updatedAt || ''
+                        }</td>
+                        <td>${getUserLabelById(project.approvedBy)}</td>
+                        <td>${
+                            project.approvedAt && typeof DateFormatter !== 'undefined'
+                                ? DateFormatter.toDisplayFormat(project.approvedAt)
+                                : project.approvedAt || ''
+                        }</td>
+                        <td>
+                            <button class="action-btn-sm" onclick="event.stopPropagation(); showRACIMatrix('${
+                                project.id
+                            }')" title="View RACI Matrix">
                                 <i class="bi bi-eye"></i>
                             </button>
-                            <button class="action-btn-sm btn-danger" onclick="event.stopPropagation(); deleteProject('${project.id}')" title="Delete project">
+                            <button class="action-btn-sm btn-danger" onclick="event.stopPropagation(); deleteProject('${
+                                project.id
+                            }')" title="Delete project">
                                 <i class="bi bi-trash"></i>
                             </button>
                         </td>
                     </tr>
                 `;
-            }).join('');
+                })
+                .join('');
         }
     }
 
     initDragAndDrop();
+    updateProjectListPagination();
+}
+
+function updateProjectListPagination() {
+    const wrapper = getEl('projectListPaginationWrapper');
+    const container = getEl('projectListPagination');
+    if (!wrapper || !container) {
+        return;
+    }
+
+    wrapper.style.display = 'flex';
+
+    if (typeof Pagination !== 'function') {
+        return;
+    }
+
+    if (!projectListPaginationInstance) {
+        projectListPaginationInstance = new Pagination({
+            container: container,
+            totalItems: projectListTotalItems,
+            itemsPerPage: projectListPageSize,
+            currentPage: projectListCurrentPage,
+            maxVisiblePages: 2,
+            edgePageCount: 2,
+            showInfo: false,
+            showPerPageSelector: false,
+            showGoToPage: true,
+            showFirstLast: false,
+            labels: {
+                prev: 'Previous',
+                next: 'Next',
+            },
+            onPageChange: async (page, itemsPerPage) => {
+                await loadProjectList(page, itemsPerPage);
+            },
+        });
+        return;
+    }
+
+    projectListPaginationInstance.update({
+        totalItems: projectListTotalItems,
+        currentPage: projectListCurrentPage,
+        itemsPerPage: projectListPageSize,
+        disabled: projectListTotalItems <= projectListPageSize,
+    });
 }
 
 function getStatusBadge(status) {
-    const badges = {
-        'approved': '<span class="badge badge-success">已核准</span>',
-        'rejected': '<span class="badge badge-danger">已拒絕</span>',
-        'in-progress': '<span class="badge badge-info">進行中</span>',
-        'completed': '<span class="badge badge-primary">已完成</span>',
-        'on-hold': '<span class="badge badge-secondary">暫停</span>'
-    };
-    return badges[status] || `<span class="badge">${status}</span>`;
+    const statusClass = getStatusBadgeClass(status);
+    const label = getStatusLabel(status);
+    return `<span class="task-status-badge ${statusClass}">${escapeHtml(label)}</span>`;
 }
-
 
 function getCustomerDisplay(cust) {
     if (cust === null || cust === undefined || cust === '' || String(cust).toLowerCase() === 'n/a') return 'N/A';
+
+    const cached = findCustomerFromCache(cust);
+    if (cached && cached.name) return cached.name;
+
     const s = String(cust).trim();
     if (s === '1' || s.toLowerCase() === 'apollo') return 'Apollo';
     if (s === '2' || s.toLowerCase() === 'rhea') return 'Rhea';
@@ -340,7 +2426,12 @@ let draggedElement = null;
 function initDragAndDrop() {
     const rows = document.querySelectorAll('tr[draggable="true"]');
 
-    rows.forEach(row => {
+    rows.forEach((row) => {
+        row.removeEventListener('dragstart', handleDragStart);
+        row.removeEventListener('dragover', handleDragOver);
+        row.removeEventListener('drop', handleDrop);
+        row.removeEventListener('dragend', handleDragEnd);
+
         row.addEventListener('dragstart', handleDragStart);
         row.addEventListener('dragover', handleDragOver);
         row.addEventListener('drop', handleDrop);
@@ -403,69 +2494,296 @@ function handleDrop(e) {
 function handleDragEnd(e) {
     this.style.opacity = '1';
 
-    document.querySelectorAll('tr[draggable="true"]').forEach(row => {
+    document.querySelectorAll('tr[draggable="true"]').forEach((row) => {
         row.style.borderTop = '';
         row.style.borderBottom = '';
     });
 }
 
 function updateProjectOrder(section) {
-    const tbody = section === 'waiting'
-        ? document.getElementById('waitingApprovalBody')
-        : document.getElementById('otherProjectsBody');
+    const tbody =
+        section === 'waiting'
+            ? document.getElementById('waitingApprovalBody')
+            : document.getElementById('otherProjectsBody');
 
     if (!tbody) return;
 
-    const newOrder = Array.from(tbody.querySelectorAll('tr')).map(tr =>
-        tr.dataset.projectId
-    );
-
+    const newOrder = Array.from(tbody.querySelectorAll('tr')).map((tr) => tr.dataset.projectId);
 }
-
 
 function viewProjectDetails(projectId) {
     showProjectTasksModal(projectId);
 }
 
+async function fetchAndRenderAttachments(taskId) {
+    if (!taskId) return;
+    try {
+        const listEl = document.getElementById('attachments-list');
+        if (!listEl) return;
+        listEl.innerHTML = '<div class="loading">Loading attachments...</div>';
+
+        const res = await fetch(`/ppap-system/api/tasks/${encodeURIComponent(taskId)}/documents`);
+        if (!res.ok) {
+            listEl.innerHTML = '<div class="text-muted">No attachments</div>';
+            return;
+        }
+
+        const json = await res.json();
+        const items = json && (json.data || json.result) ? json.data || json.result : [];
+        if (!Array.isArray(items) || items.length === 0) {
+            listEl.innerHTML = '<div class="text-muted">No attachments</div>';
+            return;
+        }
+
+        const rows = items
+            .map((it) => {
+                const url = it.url || it.downloadUrl || '';
+                const name = it.name || it.fileName || it.filename || String(it.id || '');
+                const docId = it.id || it.documentId || it.document_id || '';
+                const safeName = escapeHtml(name);
+                const safeUrl = escapeHtml(url);
+                const safeId = escapeHtml(docId);
+                return `
+                <div class="attachment-item">
+                    <div class="attachment-info">
+                        <span class="attachment-icon"><i class="bi bi-file-earmark"></i></span>
+                        <span class="attachment-name">${safeName}</span>
+                    </div>
+                    <button type="button" class="download-btn" data-url="${safeUrl}" data-filename="${safeName}">
+                        <span><i class="bi bi-download"></i> Download</span>
+                    </button>
+                    <button type="button" class="download-btn attachment-delete-btn" data-id="${safeId}" style="background: var(--accent-red); border-color: var(--accent-red);">
+                        <span><i class="bi bi-trash"></i> Delete</span>
+                    </button>
+                </div>`;
+            })
+            .join('');
+
+        listEl.innerHTML = rows;
+
+        listEl.querySelectorAll('.download-btn').forEach((btn) => {
+            btn.addEventListener('click', function () {
+                const url = this.dataset.url;
+                const filename = this.dataset.filename;
+                if (!url) return;
+
+                try {
+                    const a = document.createElement('a');
+
+                    const fullUrl = url
+
+                    a.href = fullUrl;
+                    a.download = filename || 'download';
+                    a.style.display = 'none';
+
+                    document.body.appendChild(a);
+                    a.click();
+
+                    setTimeout(() => {
+                        document.body.removeChild(a);
+                    }, 100);
+                } catch (e) {
+                    try {
+                        const fullUrl = url
+                        window.open(fullUrl, '_blank');
+                    } catch (err) {
+                        console.error('Both download methods failed', err);
+                    }
+                }
+            });
+        });
+        listEl.querySelectorAll('.attachment-delete-btn').forEach((btn) => {
+            btn.addEventListener('click', function () {
+                const docId = this.dataset.id;
+                deleteTaskDocument(docId, taskId);
+            });
+        });
+    } catch (e) {}
+}
+
+async function deleteTaskDocument(documentId, taskId) {
+    if (!documentId) return;
+    const confirmRes = await Swal.fire({
+        title: 'Delete',
+        text: 'Do you want to delete this file?',
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Delete',
+        cancelButtonText: 'Cancel',
+        confirmButtonColor: '#d33',
+    });
+    if (!confirmRes.isConfirmed) return;
+
+    const currentTaskId =
+        taskId ||
+        (function () {
+            const modal = document.getElementById('taskDetailModal');
+            return modal ? modal.dataset.taskId : null;
+        })();
+
+    try {
+        loader.load();
+        const url = `/ppap-system/api/documents/${encodeURIComponent(documentId)}/delete?delOrigin=false`;
+        const res = await fetch(url, {method: 'POST'});
+
+        if (!res.ok) {
+            const message = await getApiErrorMessage(res, `Failed to delete document (${res.status})`);
+            throw new Error(message);
+        }
+
+        let json = null;
+        try {
+            json = await res.json();
+        } catch (e) {}
+
+        const serverOk = json ? json.status === 'OK' || json.success === true || json.result === 'OK' : true;
+        if (!serverOk) {
+            const message = extractApiMessage(json) || 'Server reported failure when deleting document.';
+            throw new Error(message);
+        }
+
+        showAlertSuccess('Deleted', 'Document deleted successfully');
+        if (currentTaskId) {
+            await fetchAndRenderAttachments(currentTaskId);
+        }
+    } catch (e) {
+        console.error('deleteTaskDocument error', e);
+        showAlertError('Failed', e && e.message ? e.message : 'Failed to delete document.');
+    } finally {
+        loader.unload();
+    }
+}
 
 async function showProjectTasksModal(projectId) {
-    const project = projectList.find(p => String(p.id) === String(projectId));
+    if (!projectId || projectId === 'null' || projectId === 'undefined') {
+        showAlertWarning('Warning', 'Invalid project ID');
+        return;
+    }
+
+    const parsedId = parseInt(projectId, 10);
+    if (isNaN(parsedId)) {
+        showAlertWarning('Warning', 'Invalid project ID');
+        return;
+    }
+
+    const project = findProjectById(projectId);
 
     try {
         const pidEl = document.getElementById('pt_detail_projectId');
         const setAndDisable = (id, val) => {
             const el = document.getElementById(id);
-            if (el) { el.value = val || ''; el.disabled = true; }
+            if (el) {
+                el.value = val || '';
+                el.disabled = true;
+            }
         };
 
         if (project) {
-            const cust = project.customer;
-            let customerName = 'N/A';
-            if (cust === 1 || cust === '1' || String(cust).toLowerCase() === 'apollo') customerName = 'Apollo';
-            else if (cust === 2 || cust === '2' || String(cust).toLowerCase() === 'rhea') customerName = 'Rhea';
-            else if (cust === 3 || cust === '3' || String(cust).toLowerCase() === 'kronos') customerName = 'Kronos';
-            else if (cust) customerName = String(cust);
+            const customerName = getCustomerDisplay(project.customer);
+            const customerIdForCft = mapCustomerToId(project.customer);
+            const cftMap = project.cftId ? await ensureCftNameMapForCustomer(customerIdForCft) : null;
+            const cftName =
+                project.cftId && cftMap ? cftMap[String(project.cftId).trim()] || '' : '';
 
             if (pidEl) pidEl.value = project.id;
             setAndDisable('pt_detail_customer', customerName);
+            setAndDisable('pt_detail_cft', cftName || project.cftId || '');
             setAndDisable('pt_detail_projectName', project.name || '');
+            setAndDisable('pt_detail_product', project.product || '');
             setAndDisable('pt_detail_createdDate', project.createdDate || '');
             setAndDisable('pt_detail_status', project.status || '');
+            setAndDisable('pt_detail_model', project.model || 'N/A');
         } else {
-            const ids = ['pt_detail_projectId', 'pt_detail_customer', 'pt_detail_projectName', 'pt_detail_createdDate', 'pt_detail_status'];
-            ids.forEach(id => { const el = document.getElementById(id); if (el) { el.value = ''; el.disabled = true; } });
+            const ids = [
+                'pt_detail_projectId',
+                'pt_detail_customer',
+                'pt_detail_cft',
+                'pt_detail_projectName',
+                'pt_detail_product',
+                'pt_detail_createdDate',
+                'pt_detail_status',
+            ];
+            ids.forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) {
+                    el.value = '';
+                    el.disabled = true;
+                }
+            });
         }
-    } catch (e) {
-        console.warn('Failed to populate project detail pane:', e);
-    }
+    } catch (e) {}
 
-    const container = document.getElementById('projectTasksContent');
-    if (container) container.innerHTML = `<div style="text-align:center;padding:20px;color:var(--text-secondary)"><i class="bi bi-hourglass-split"></i> Loading tasks...</div>`;
+    try {
+        const modalEl = document.getElementById('projectTasksModal');
+        if (modalEl) {
+            const footer = modalEl.querySelector('.modal-footer');
+            const statusVal = project && project.status ? String(project.status).toUpperCase() : '';
+            const waiting =
+                statusVal === 'WAITING_FOR_APPROVAL' ||
+                statusVal === 'WAITING' ||
+                (statusVal.indexOf('WAIT') !== -1 && statusVal.indexOf('APPROVAL') !== -1);
+            const onGoing = statusVal === 'ON_GOING';
+
+            const saveBtn = footer ? footer.querySelector("button[onclick='saveProjectTaskQuantity()']") : null;
+            const submitBtn = footer ? footer.querySelector("button[onclick='projectTasksSubmit()']") : null;
+
+            let approveBtn = footer ? footer.querySelector('#pt_approve_btn') : null;
+            let rejectBtn = footer ? footer.querySelector('#pt_reject_btn') : null;
+            if (footer && !rejectBtn) {
+                rejectBtn = document.createElement('button');
+                rejectBtn.id = 'pt_reject_btn';
+                rejectBtn.className = 'btn action-btn';
+                rejectBtn.type = 'button';
+                rejectBtn.innerHTML = '<i class="bi bi-x-circle"></i> Reject';
+                rejectBtn.style.backgroundColor = '#dc3545';
+                rejectBtn.style.color = 'white';
+                rejectBtn.style.display = 'none';
+                rejectBtn.addEventListener('click', function (ev) {
+                    ev.stopPropagation();
+                    if (project && project.id) rejectProject(project.id);
+                });
+                footer.appendChild(rejectBtn);
+            }
+
+            if (footer && !approveBtn) {
+                approveBtn = document.createElement('button');
+                approveBtn.id = 'pt_approve_btn';
+                approveBtn.className = 'btn action-btn';
+                approveBtn.type = 'button';
+                approveBtn.innerHTML = '<i class="bi bi-check-circle"></i> Approve';
+                approveBtn.style.display = 'none';
+                approveBtn.addEventListener('click', function (ev) {
+                    ev.stopPropagation();
+                    if (project && project.id) approveProject(project.id);
+                });
+                footer.appendChild(approveBtn);
+            }
+
+            if (waiting) {
+                if (saveBtn) saveBtn.style.display = 'none';
+                if (submitBtn) submitBtn.style.display = 'none';
+                if (approveBtn) approveBtn.style.display = 'inline-flex';
+                if (rejectBtn) rejectBtn.style.display = 'inline-flex';
+            } else {
+                if (saveBtn) saveBtn.style.display = '';
+                if (submitBtn) submitBtn.style.display = onGoing ? 'none' : '';
+                if (approveBtn) approveBtn.style.display = 'none';
+                if (rejectBtn) rejectBtn.style.display = 'none';
+            }
+        }
+    } catch (e) {}
 
     openProjectTasksModal();
 
     try {
-        const res = await fetch(`/sample-system/api/tasks/get-by-project-id?projectId=${parseInt(projectId, 10)}`);
+        const url = new URL(window.location.href);
+        url.searchParams.set('projectId', String(projectId));
+        window.history.pushState({projectId: projectId}, '', url.toString());
+    } catch (e) {}
+
+    try {
+        loader.load();
+        const res = await fetch(`/ppap-system/api/project/${projectId}/tasks`);
 
         if (!res.ok) throw new Error(`Status ${res.status} ${res.statusText}`);
 
@@ -480,55 +2798,346 @@ async function showProjectTasksModal(projectId) {
         if (currentProject && String(currentProject.id) === String(projectId)) {
             selectedPPAPItems = tasks.slice();
         }
-
-        renderProjectTasksContent(tasks, projectId);
-
     } catch (e) {
         console.error('Failed to load tasks:', e);
+        const container = document.getElementById('projectTasksContent');
         if (container) {
             container.innerHTML = `<div style="color:var(--danger);text-align:center;padding:20px"><i class="bi bi-exclamation-triangle"></i> Failed to load tasks. Please try again.</div>`;
         }
+    } finally {
+        loader.unload();
     }
-}
 
+    try {
+        await loadProjectStagesAndTasks(projectId, null, {skipLoader: true});
+    } catch (e) {}
+}
 
 function renderProjectTasksContent(tasks, projectId) {
     const container = document.getElementById('projectTasksContent');
     if (!container) return;
 
     if (tasks.length === 0) {
-        container.innerHTML = `<div style="color:var(--text-secondary)">This project has no tasks.</div>`;
+        container.innerHTML = `<div class="text-center" style="color:var(--text-secondary)">This project has no tasks.</div>`;
     } else {
-        const rows = tasks.map(t => `
-            <tr data-task-id="${t.id}" style="cursor:pointer" onclick="showTaskDetailModal(${projectId}, '${t.id}')">
-                <td>${t.id}</td>
-                <td>${t.name || ''}</td>
-                <td>${t.taskCode || ''}</td>
-                <td>${t.processId || ''}</td>
-                <td>${t.status || ''}</td>
-                <td>${t.priority || ''}</td>
-                <td>${t.dri || ''}</td>
-                <td>${t.dueDate || ''}</td>
+        const rows = tasks
+            .map((t, index) => {
+                if (t) t.step = index + 1;
+
+                const statusClass = getStatusBadgeClass(t.status);
+                const statusLabel = getStatusLabel(t.status);
+                const statusBadge = `<span class="task-status-badge ${statusClass}">${escapeHtml(statusLabel)}</span>`;
+
+                const priorityClass = getPriorityBadgeClass(t.priority);
+                const priorityLabel = getPriorityLabel(t.priority);
+                const priorityBadge = `<span class="priority-badge ${priorityClass}">${escapeHtml(
+                    priorityLabel
+                )}</span>`;
+
+                const stageName = escapeHtml(getStageName(t.stageId) || '');
+                const processName = escapeHtml(getProcessName(t.processId) || '');
+                const driDisplay = escapeHtml(getUserLabelById(t.dri) || t.dri || '');
+
+                return `
+            <tr draggable="true" 
+                data-task-id="${t.id}" 
+                data-task-index="${index}"
+                onclick="showTaskDetailModal(${projectId}, '${t.id}')">
+                <td class="drag-handle" style="width:36px;text-align:center;cursor:grab" onmousedown="event.stopPropagation()">
+                    <i class="bi bi-grip-vertical" title="Drag" aria-hidden="true"></i>
+                </td>
+                <td style="width:48px">${t.step || index + 1}</td>
+                <td>${escapeHtml(t.taskCode || '')}</td>
+                <td>${escapeHtml(t.name || '')}</td>
+                <td>${stageName}</td>
+                <td>${processName}</td>
+                <td>${statusBadge}</td>
+                <td>${priorityBadge}</td>
+                <td>${driDisplay}</td>
+                <td>${escapeHtml(t.dueDate || '')}</td>
                 <td style="text-align:center">
-                    <button class="action-btn-sm" onclick="event.stopPropagation(); removeTaskFromProject('${projectId}', '${t.id}')" title="Remove">
+                    <button class="action-btn-sm btn-danger" onclick="event.stopPropagation(); removeTaskFromProject('${projectId}', '${
+                    t.id
+                }')" title="Remove">
                         <i class="bi bi-trash"></i>
                     </button>
                 </td>
             </tr>
-        `).join('');
+        `;
+            })
+            .join('');
 
         container.innerHTML = `
-            <table class="task-list-table" style="margin-top:12px">
+            <table id="projectTasksTable" class="table mt-0">
                 <thead>
                     <tr>
-                        <th>ID</th><th>Name</th><th>Task Code</th><th>Process</th>
-                        <th>Status</th><th>Priority</th><th>DRI</th><th>Deadline</th><th>Actions</th>
+                        <th></th>
+                        <th>#</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.taskNum}</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.taskName}</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.stage}</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.process}</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.status}</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.priority}</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.dri}</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.deadline}</th>
+                        <th>${PROJECT_TASK_TABLE_LABELS.actions}</th>
                     </tr>
                 </thead>
                 <tbody>${rows}</tbody>
             </table>
         `;
+
+        try {
+            if (!document.getElementById('ppap-drag-handle-style')) {
+                const style = document.createElement('style');
+                style.id = 'ppap-drag-handle-style';
+                style.innerHTML = `.drag-handle { cursor: grab; } .drag-handle:active { cursor: grabbing; }`;
+                document.head.appendChild(style);
+            }
+        } catch (e) {}
+
+        initProjectTasksDragAndDrop(projectId);
     }
+}
+
+async function refreshStageOptions(projectId) {
+    const stages = await fetchOptions('/api/stages');
+    let mergedStages = stages;
+
+    if (projectId) {
+        const projectStages = await fetchStagesForProject(projectId);
+        const map = {};
+        stages.forEach((s) => {
+            if (s && s.id !== null && s.id !== undefined) map[String(s.id)] = s;
+        });
+        projectStages.forEach((s) => {
+            if (s && s.id !== null && s.id !== undefined) map[String(s.id)] = s;
+        });
+        mergedStages = Object.values(map);
+    }
+
+    SELECT_CACHE['/api/stages'] = mergedStages;
+    renderOptions('sl-xvt', mergedStages);
+    renderOptions('custom-sl-xvt', mergedStages);
+    renderOptions('ppapFilterStage', mergedStages);
+}
+
+async function loadTaskDetailStageOptions(projectId, currentStageId) {
+    const modalRoot = document.getElementById('taskDetailModal');
+    const stageSelect = modalRoot ? modalRoot.querySelector('#sl-xvt') : null;
+    if (!stageSelect) return;
+
+    let stages = [];
+    if (projectId) {
+        stages = await fetchStagesForProject(projectId);
+    }
+    if (!Array.isArray(stages) || stages.length === 0) {
+        stages = await fetchOptions('/api/stages');
+    }
+
+    if (Array.isArray(stages)) {
+        SELECT_CACHE['/api/stages'] = stages;
+    }
+
+    renderOptions('sl-xvt', stages);
+
+    if (currentStageId !== null && currentStageId !== undefined && currentStageId !== '') {
+        const val = String(currentStageId);
+        const hasOption = Array.from(stageSelect.options).some((o) => String(o.value) === val);
+        if (!hasOption) {
+            const opt = document.createElement('option');
+            opt.value = val;
+            opt.textContent = getStageName(currentStageId) || val;
+            stageSelect.add(opt, stageSelect.options[0] || null);
+        }
+        stageSelect.value = val;
+    }
+}
+
+async function handleCreateStageConfirm() {
+    const modalEl = document.getElementById('createStageModal');
+    const input = modalEl ? modalEl.querySelector('#new-stage-name') : null;
+    const name = input ? String(input.value || '').trim() : '';
+
+    if (!name) {
+        showAlertWarning('Warning', 'Stage name is required');
+        if (input && typeof input.focus === 'function') input.focus();
+        return;
+    }
+
+    const projectId = document.getElementById('pt_detail_projectId')?.value;
+    const parsedProjectId = projectId ? parseInt(projectId, 10) : null;
+    if (!parsedProjectId || Number.isNaN(parsedProjectId)) {
+        showAlertWarning('Warning', 'Project ID not found');
+        return;
+    }
+
+    try {
+        loader.load();
+        const res = await fetch('/ppap-system/api/stages/create', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({name: name, projectId: parsedProjectId}),
+        });
+
+        if (!res.ok) {
+            const message = await getApiErrorMessage(res, `Create stage failed (${res.status})`);
+            showAlertError('Failed', message);
+            return;
+        }
+
+        let json = null;
+        try {
+            json = await res.json();
+        } catch (e) {}
+
+        if (json && (json.status === 'ERROR' || json.success === false)) {
+            const message = extractApiMessage(json) || 'Failed to create stage';
+            showAlertError('Failed', message);
+            return;
+        }
+
+        showAlertSuccess('Success', 'Stage created successfully');
+        safeHideModal(modalEl);
+        const createdStage = json ? json.data || json.result || null : null;
+        const createdStageId = createdStage && createdStage.id ? createdStage.id : null;
+        await refreshStageOptions(parsedProjectId);
+        await loadProjectStagesAndTasks(parsedProjectId, createdStageId, {skipLoader: true});
+    } catch (e) {
+        console.error('Create stage error:', e);
+        showAlertError('Failed', e && e.message ? e.message : 'Failed to create stage');
+    } finally {
+        loader.unload();
+    }
+}
+
+let draggedProjectTask = null;
+
+function initProjectTasksDragAndDrop(projectId) {
+    const table = document.getElementById('projectTasksTable');
+    if (!table) return;
+
+    const rows = table.querySelectorAll('tbody tr[draggable="true"]');
+
+    rows.forEach((row) => {
+        row.removeEventListener('dragstart', handleProjectTaskDragStart);
+        row.removeEventListener('dragover', handleProjectTaskDragOver);
+        row.removeEventListener('drop', handleProjectTaskDrop);
+        row.removeEventListener('dragend', handleProjectTaskDragEnd);
+
+        row.addEventListener('dragstart', handleProjectTaskDragStart);
+        row.addEventListener('dragover', handleProjectTaskDragOver);
+        row.addEventListener('drop', function (e) {
+            return handleProjectTaskDrop.call(this, e, projectId);
+        });
+        row.addEventListener('dragend', handleProjectTaskDragEnd);
+    });
+}
+
+function handleProjectTaskDragStart(e) {
+    draggedProjectTask = this;
+    this.style.opacity = '0.4';
+    e.dataTransfer.effectAllowed = 'move';
+}
+
+function handleProjectTaskDragOver(e) {
+    if (e.preventDefault) e.preventDefault();
+    if (!draggedProjectTask) return false;
+
+    const rect = this.getBoundingClientRect();
+    const midpoint = rect.top + rect.height / 2;
+
+    if (e.clientY < midpoint) {
+        this.style.borderTop = '2px solid #2196F3';
+        this.style.borderBottom = '';
+    } else {
+        this.style.borderBottom = '2px solid #2196F3';
+        this.style.borderTop = '';
+    }
+
+    return false;
+}
+
+function handleProjectTaskDrop(e, projectId) {
+    if (e.stopPropagation) e.stopPropagation();
+    if (!draggedProjectTask || draggedProjectTask === this) return false;
+
+    const rect = this.getBoundingClientRect();
+    const midpoint = rect.top + rect.height / 2;
+
+    if (e.clientY < midpoint) {
+        this.parentNode.insertBefore(draggedProjectTask, this);
+    } else {
+        this.parentNode.insertBefore(draggedProjectTask, this.nextSibling);
+    }
+
+    updateProjectTaskOrder(projectId);
+
+    try {
+        const tasks = getCurrentStageTasks(projectId);
+        renderProjectTasksContent(tasks, projectId);
+    } catch (e) {}
+
+    document.querySelectorAll('#projectTasksTable tbody tr').forEach((r) => {
+        r.style.borderTop = '';
+        r.style.borderBottom = '';
+    });
+
+    return false;
+}
+
+function handleProjectTaskDragEnd(e) {
+    this.style.opacity = '1';
+    document.querySelectorAll('#projectTasksTable tbody tr').forEach((r) => {
+        r.style.borderTop = '';
+        r.style.borderBottom = '';
+    });
+    draggedProjectTask = null;
+}
+
+function updateProjectTaskOrder(projectId) {
+    const project = findProjectById(projectId);
+    if (!project || !project.tasks) return;
+
+    const tbody = document.querySelector('#projectTasksTable tbody');
+    if (!tbody) return;
+
+    const newOrder = Array.from(tbody.querySelectorAll('tr')).map((tr) => tr.dataset.taskId);
+
+    const taskMap = {};
+    project.tasks.forEach((t) => {
+        taskMap[String(t.id)] = t;
+    });
+
+    const orderedStageTasks = newOrder.map((id) => taskMap[String(id)]).filter(Boolean);
+    const stageId = getCurrentStageId(projectId);
+    setCurrentStageState(projectId, stageId, orderedStageTasks);
+    if (stageId && projectId) {
+        STANDARD_PPAP_STAGE_BY_PROJECT[String(projectId)] = stageId;
+    }
+
+    if (!stageId) {
+        project.tasks = orderedStageTasks;
+    } else {
+        const stageIdStr = String(stageId);
+        let stageIndex = 0;
+        project.tasks = project.tasks.map((t) => {
+            if (t && String(t.stageId) === stageIdStr) {
+                const replacement = orderedStageTasks[stageIndex++];
+                return replacement || t;
+            }
+            return t;
+        });
+    }
+
+    orderedStageTasks.forEach((t, idx) => {
+        try {
+            t.step = idx + 1;
+        } catch (e) {}
+    });
 }
 
 function openProjectTasksModal() {
@@ -542,10 +3151,16 @@ function openProjectTasksModal() {
 }
 
 function showEditTaskModal(projectId, taskId) {
-    const project = projectList.find(p => String(p.id) === String(projectId));
-    if (!project) { alert('Project not found'); return; }
-    const task = (project.tasks || []).find(t => String(t.id) === String(taskId));
-    if (!task) { alert('Task not found'); return; }
+    const project = projectList.find((p) => String(p.id) === String(projectId));
+    if (!project) {
+        showAlertError('Error', 'Project not found');
+        return;
+    }
+    const task = (project.tasks || []).find((t) => String(t.id) === String(taskId));
+    if (!task) {
+        showAlertError('Error', 'Task not found');
+        return;
+    }
 
     getEl('editTaskProjectId').value = projectId;
     getEl('editTaskId').value = taskId;
@@ -555,91 +3170,172 @@ function showEditTaskModal(projectId, taskId) {
     getEl('editTaskStatus').value = task.status || '';
     getEl('editTaskPriority').value = task.priority || '';
 
-    try { new bootstrap.Modal(document.getElementById('editTaskModal')).show(); }
-    catch (e) { const el = document.getElementById('editTaskModal'); if (el) el.classList.add('active'); }
+    try {
+        new bootstrap.Modal(document.getElementById('editTaskModal')).show();
+    } catch (e) {
+        const el = document.getElementById('editTaskModal');
+        if (el) el.classList.add('active');
+    }
 }
 
 async function showTaskDetailModal(projectId, taskId) {
-    let task = null;
-    try {
-        const project = projectList.find(p => String(p.id) === String(projectId));
+    if (!taskId || taskId === 'null' || taskId === 'undefined') {
+        showAlertWarning('Warning', 'Invalid task ID');
+        return;
+    }
 
-        try {
-            const res = await fetch(`/sample-system/api/tasks/get-by-id?id=${encodeURIComponent(taskId)}`);
-            if (res.ok) {
-                const json = await res.json();
-                task = json.data || json.result || null;
-            } else {
-                console.warn('showTaskDetailModal: server returned', res.status, res.statusText);
-            }
-        } catch (fetchErr) {
-            console.warn('showTaskDetailModal: fetch failed, will attempt local fallback', fetchErr);
+    try {
+        loader.load();
+
+        let task = null;
+        const project = findProjectById(projectId);
+
+        const res = await fetch(`/ppap-system/api/tasks/${taskId}`);
+        if (res.ok) {
+            const json = await res.json();
+            task = json.data || json.result || null;
         }
 
-        if (!task && project && Array.isArray(project.tasks)) {
-            task = project.tasks.find(t => String(t.id) === String(taskId));
+        if (!task && project?.tasks) {
+            task = project.tasks.find((t) => String(t.id) === String(taskId));
         }
 
         if (!task) {
-            alert('Task not found');
+            showAlertError('Error', 'Task not found');
             return;
         }
 
         const modalRoot = document.getElementById('taskDetailModal');
-        if (!modalRoot) return;
-
-        // store project/task identifiers on modal and keep a copy of full task JSON
-        try {
-            modalRoot.dataset.projectId = String(projectId || '');
-            modalRoot.dataset.taskId = String(taskId || '');
-            currentTaskDetailObj = task ? JSON.parse(JSON.stringify(task)) : null;
-        } catch (e) {
-            console.warn('Failed to attach task metadata to modal', e);
+        if (!modalRoot) {
+            showAlertError('Error', 'Modal not found');
+            return;
         }
+
+        const resolvedProjectId =
+            projectId || task.projectId || task.project_id || task.project_id_fk || null;
+
+        modalRoot.dataset.projectId = String(resolvedProjectId || '');
+        modalRoot.dataset.taskId = String(taskId || '');
+        currentTaskDetailObj = JSON.parse(JSON.stringify(task));
+        try {
+            await syncFollowButtonState(taskId, modalRoot);
+        } catch (e) {}
+
+        const url = new URL(window.location.href);
+        url.searchParams.set('taskId', String(taskId));
+        window.history.pushState({taskId, projectId: projectId || null}, '', url.toString());
 
         const setText = (selector, value) => {
             const el = modalRoot.querySelector(selector);
             if (el) el.textContent = value || '';
         };
 
-        setText('.task-detail-id', task.taskCode || String(task.id || ''));
-        setText('.task-detail-name', task.name || '');
-        const descEl = modalRoot.querySelector('.section-content');
-        if (descEl) descEl.textContent = task.description || '';
+        const taskNameEl = modalRoot.querySelector('.task-detail-name');
+        if (taskNameEl) {
+            taskNameEl.textContent = task.name || '';
+            taskNameEl.style.cursor = 'pointer';
+            taskNameEl.title = 'Click to edit';
+            taskNameEl.onclick = function (e) {
+                e.stopPropagation();
+                e.preventDefault();
+                const currentValue = this.textContent;
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = currentValue;
+                input.className = 'task-name-edit-input';
+                input.style.cssText = 'width: 100%; font-size: inherit; font-weight: inherit; background: var(--secondary-bg); color: var(--text-primary); border: 1px solid var(--border-color); outline: none; padding: 4px 8px; border-radius: 4px;';
 
-        setText('.date-display', task.dueDate || task.deadline || '');
-        setText('.assignee-name', task.dri || task.assignee || '');
+                const saveEdit = () => {
+                    this.textContent = input.value || currentValue;
+                    this.style.display = '';
+                    input.remove();
+                };
 
-        try {
-            const driInput = document.getElementById('dri');
-            if (driInput) {
-                const driVal = task.dri ?? null;
-                driInput.value = driVal ? driVal : 'N/A';
-            }
+                input.onblur = saveEdit;
+                input.onkeydown = (e) => {
+                    e.stopPropagation();
+                    if (e.key === 'Enter') { e.preventDefault(); saveEdit(); }
+                    if (e.key === 'Escape') { e.preventDefault(); this.textContent = currentValue; this.style.display = ''; input.remove(); }
+                };
 
-            const deadLineInput = document.getElementById('deadLine');
-            const dueVal = task.dueDate ?? task.deadline ?? null;
-            if (deadLineInput) {
-                deadLineInput.value = dueVal ? dueVal : 'N/A';
-            }
+                this.style.display = 'none';
+                this.parentNode.insertBefore(input, this.nextSibling);
+                input.focus();
+                input.select();
+            };
         }
-        catch (e) {
-            console.warn('Failed to set sidebar inputs (#dri, #deadLine):', e);
+
+        setText('.task-detail-id', task.taskCode || String(task.id || ''));
+
+        const descEl = modalRoot.querySelector('.section-content');
+        if (descEl) {
+            descEl.textContent = task.description || '';
+            descEl.style.cursor = 'pointer';
+            descEl.title = 'Click to edit';
+            descEl.onclick = function (e) {
+                e.stopPropagation();
+                e.preventDefault();
+                const currentValue = this.textContent;
+                const textarea = document.createElement('textarea');
+                textarea.value = currentValue;
+                textarea.className = 'task-desc-edit-input';
+                textarea.style.cssText = 'width: 100%; min-height: 100px; font-size: inherit; background: var(--secondary-bg); color: var(--text-primary); border: 1px solid var(--border-color); outline: none; padding: 8px; border-radius: 4px; resize: vertical;';
+
+                let isRemoving = false;
+                const saveEdit = () => {
+                    if (isRemoving) return;
+                    isRemoving = true;
+                    this.textContent = textarea.value || currentValue;
+                    this.style.display = '';
+                    if (textarea.parentNode) textarea.remove();
+                };
+
+                textarea.onblur = saveEdit;
+                textarea.onkeydown = (e) => {
+                    e.stopPropagation();
+                    if (e.key === 'Escape') { e.preventDefault(); if (!isRemoving) { isRemoving = true; this.textContent = currentValue; this.style.display = ''; if (textarea.parentNode) textarea.remove(); } }
+                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEdit(); }
+                };
+
+                this.style.display = 'none';
+                this.parentNode.insertBefore(textarea, this.nextSibling);
+                textarea.focus();
+            };
+        }
+
+        setText('.date-display', task.dueDate || task.deadline || '-');
+        setText('.assignee-name', task.dri || task.assignee || '-');
+
+        const driInput = document.getElementById('dri');
+        if (driInput) driInput.value = task.dri ?? task.assignee ?? '';
+
+        const deadLineInput = document.getElementById('deadLine');
+        if (deadLineInput) {
+            const dueVal = task.dueDate || task.deadline || null;
+            if (dueVal) {
+                const normalized = DateFormatter.toDisplayFormat(dueVal);
+                deadLineInput.value = normalized;
+                deadLineInput.dataset.initialValue = normalized;
+            } else {
+                deadLineInput.value = '';
+                deadLineInput.dataset.initialValue = '';
+            }
         }
 
         const statusBadge = modalRoot.querySelector('.task-status-badge');
         if (statusBadge) {
             statusBadge.textContent = task.status || '';
             statusBadge.classList.remove('status-in-progress', 'status-completed', 'status-pending', 'status-overdue');
-            if (String(task.status).toLowerCase().includes('progress')) statusBadge.classList.add('status-in-progress');
-            else if (String(task.status).toLowerCase().includes('complete')) statusBadge.classList.add('status-completed');
-            else if (String(task.status).toLowerCase().includes('overdue')) statusBadge.classList.add('status-overdue');
+            const statusLower = String(task.status).toLowerCase();
+            if (statusLower.includes('progress')) statusBadge.classList.add('status-in-progress');
+            else if (statusLower.includes('complete')) statusBadge.classList.add('status-completed');
+            else if (statusLower.includes('overdue')) statusBadge.classList.add('status-overdue');
             else statusBadge.classList.add('status-pending');
         }
 
         const priorityBadge = modalRoot.querySelector('.priority-badge');
         if (priorityBadge) {
-            priorityBadge.textContent = (task.priority && String(task.priority)) || (task.priority === 0 ? '0' : (task.priority || ''));
+            priorityBadge.textContent = task.priority === 0 ? '0' : String(task.priority || '');
             priorityBadge.classList.remove('priority-high', 'priority-medium', 'priority-low');
             const p = String(task.priority || '').toLowerCase();
             if (p === 'high') priorityBadge.classList.add('priority-high');
@@ -647,82 +3343,164 @@ async function showTaskDetailModal(projectId, taskId) {
             else if (p === 'low') priorityBadge.classList.add('priority-low');
         }
 
-        try {
-            const statusSelect = modalRoot.querySelector('#sl-status');
-            const prioritySelect = modalRoot.querySelector('#sl-priority');
-
-            const ensureAndSet = (selectEl, value) => {
-                if (!selectEl) return;
-                const val = (value === null || value === undefined || String(value).trim() === '') ? 'N/A' : String(value);
-                // Check if option exists
-                const hasOption = Array.from(selectEl.options).some(o => String(o.value) === val);
-                if (!hasOption) {
+        const statusSelect = modalRoot.querySelector('#sl-status');
+        if (statusSelect) {
+            const statusRes = await fetch('/ppap-system/api/tasks/status?forUpdate=true');
+            if (statusRes.ok) {
+                const statusJson = await statusRes.json();
+                const statuses = statusJson.data || [];
+                statusSelect.innerHTML = '<option value="">--Select--</option>';
+                statuses.forEach((s) => {
                     const opt = document.createElement('option');
-                    opt.value = val;
-                    opt.text = val === 'N/A' ? 'N/A' : val;
-                    // insert at top after placeholder if present
-                    if (selectEl.options.length > 0) selectEl.add(opt, selectEl.options[0]);
-                    else selectEl.add(opt);
-                }
-                selectEl.value = val;
-            };
-
-            ensureAndSet(statusSelect, task.status);
-            ensureAndSet(prioritySelect, task.priority);
-        } catch (e) {
-            console.warn('Failed to set status/priority selects in task detail modal', e);
+                    if (typeof s === 'string' || typeof s === 'number') {
+                        opt.value = s;
+                        opt.textContent = s;
+                    } else if (s?.id && s?.name) {
+                        opt.value = s.id;
+                        opt.textContent = s.name;
+                    } else if (s?.name) {
+                        opt.value = s.name;
+                        opt.textContent = s.name;
+                    }
+                    statusSelect.appendChild(opt);
+                });
+            }
         }
+
+        const ensureAndSet = (selectEl, value) => {
+            if (!selectEl) return;
+            const val = value === null || value === undefined || String(value).trim() === '' ? 'N/A' : String(value);
+            const hasOption = Array.from(selectEl.options).some((o) => String(o.value) === val);
+            if (!hasOption) {
+                const opt = document.createElement('option');
+                opt.value = val;
+                opt.text = val === 'N/A' ? 'N/A' : val;
+                if (selectEl.options.length > 0) selectEl.add(opt, selectEl.options[0]);
+                else selectEl.add(opt);
+            }
+            selectEl.value = val;
+        };
+
+        const prioritySelect = modalRoot.querySelector('#sl-priority');
+        ensureAndSet(statusSelect, task.status);
+        ensureAndSet(prioritySelect, task.priority);
+
+        const taskStageId =
+            task.stageId || (task.stage && task.stage.id) || task.stage_id || task.stageId || null;
+        await loadTaskDetailStageOptions(resolvedProjectId, taskStageId);
+
+        wireTaskDetailWorkflowActions(modalRoot);
+        const statusVal = getTaskDetailStatusValue(modalRoot) || task.status;
+        updateTaskDetailFooterButtons(modalRoot, statusVal);
 
         try {
-            const anyOtherModalOpen = document.querySelectorAll('.modal.show').length > 0;
+            const normalizedStatus = normalizeStatus(task.status);
+            const isLocked = normalizedStatus === 'WAITING_FOR_APPROVAL' || normalizedStatus === 'COMPLETED';
+            const statusSelect = modalRoot.querySelector('#sl-status') || modalRoot.querySelector('#modal-sl-status');
+            const prioritySelect = modalRoot.querySelector('#sl-priority') || modalRoot.querySelector('#modal-sl-priority');
+            const driSelect = document.getElementById('dri');
+            const deadlineInput = document.getElementById('deadLine');
+            const stageSelect = modalRoot.querySelector('#sl-xvt');
+            const typeSelect = modalRoot.querySelector('#sl-type');
+            const uploadBtn = document.getElementById('upload');
+            const saveBtn = modalRoot.querySelector('.js-task-save');
 
-            if (anyOtherModalOpen) {
-                if (modalRoot.parentElement !== document.body) document.body.appendChild(modalRoot);
-
-                const elems = Array.from(document.querySelectorAll('.modal, .modal-backdrop')).filter(el => el !== modalRoot);
-                let highest = 1040;
-                elems.forEach(el => {
-                    const z = window.getComputedStyle(el).zIndex;
-                    const zi = parseInt(z, 10);
-                    if (!isNaN(zi) && zi > highest) highest = zi;
-                });
-
-                const backdropZ = highest + 1;
-                const modalZ = highest + 2;
-
-                const modal = new bootstrap.Modal(modalRoot);
-                modal.show();
-
-                setTimeout(() => {
-                    try {
-                        modalRoot.style.zIndex = modalZ;
-                        const backdrops = document.querySelectorAll('.modal-backdrop');
-                        if (backdrops && backdrops.length) {
-                            backdrops[backdrops.length - 1].style.zIndex = backdropZ;
-                        }
-                    } catch (err) {
-                        console.warn('Failed to adjust z-index for stacked modal', err);
+            if (isLocked) {
+                if (statusSelect) statusSelect.disabled = true;
+                if (prioritySelect) prioritySelect.disabled = true;
+                if (driSelect) {
+                    driSelect.disabled = true;
+                    if (window.jQuery && $(driSelect).data('select2')) {
+                        $(driSelect).prop('disabled', true).trigger('change');
                     }
-                }, 50);
+                }
+                if (deadlineInput) deadlineInput.disabled = true;
+                if (stageSelect) stageSelect.disabled = true;
+                if (typeSelect) typeSelect.disabled = true;
+                if (uploadBtn) uploadBtn.disabled = true;
+                if (saveBtn) saveBtn.disabled = true;
             } else {
-                const modal = new bootstrap.Modal(modalRoot);
-                modal.show();
+                if (statusSelect) statusSelect.disabled = false;
+                if (prioritySelect) prioritySelect.disabled = false;
+                if (driSelect) {
+                    driSelect.disabled = false;
+                    if (window.jQuery && $(driSelect).data('select2')) {
+                        $(driSelect).prop('disabled', false).trigger('change');
+                    }
+                }
+                if (deadlineInput) deadlineInput.disabled = false;
+                if (stageSelect) stageSelect.disabled = false;
+                if (typeSelect) typeSelect.disabled = false;
+                if (uploadBtn) uploadBtn.disabled = false;
+                if (saveBtn) saveBtn.disabled = false;
             }
-        } catch (e) {
-            if (modalRoot) modalRoot.classList.add('active');
+        } catch (e) {}
+
+        const anyOtherModalOpen = document.querySelectorAll('.modal.show').length > 0;
+
+        if (anyOtherModalOpen) {
+            if (modalRoot.parentElement !== document.body) document.body.appendChild(modalRoot);
+
+            const elems = Array.from(document.querySelectorAll('.modal, .modal-backdrop')).filter((el) => el !== modalRoot);
+            let highest = 1040;
+            elems.forEach((el) => {
+                const zi = parseInt(window.getComputedStyle(el).zIndex, 10);
+                if (!isNaN(zi) && zi > highest) highest = zi;
+            });
+
+            const backdropZ = highest + 1;
+            const modalZ = highest + 2;
+
+            const modal = new bootstrap.Modal(modalRoot);
+            modal.show();
+
+            setTimeout(() => {
+                modalRoot.style.zIndex = modalZ;
+                const backdrops = document.querySelectorAll('.modal-backdrop');
+                if (backdrops?.length) backdrops[backdrops.length - 1].style.zIndex = backdropZ;
+                initDeadlinePicker();
+                initTaskDetailDriSelect2();
+                if (driInput && task.dri) {
+                    driInput.value = task.dri;
+                    if (window.jQuery && $(driInput).data('select2')) {
+                        $(driInput).val(task.dri).trigger('change');
+                    }
+                }
+            }, 50);
+        } else {
+            const modal = new bootstrap.Modal(modalRoot);
+            modal.show();
+
+            setTimeout(() => {
+                initDeadlinePicker();
+                initTaskDetailDriSelect2();
+                if (driInput && task.dri) {
+                    driInput.value = task.dri;
+                    if (window.jQuery && $(driInput).data('select2')) {
+                        $(driInput).val(task.dri).trigger('change');
+                    }
+                }
+            }, 50);
         }
+
+        await fetchAndRenderAttachments(taskId);
+        await getComments(taskId);
 
     } catch (e) {
-        console.error('Error opening task detail modal:', e);
-        alert('Failed to load task detail');
+        showAlertError('Error', 'Failed to load task detail');
+    } finally {
+        loader.unload();
     }
 }
 
 function saveEditedTask() {
     const projectId = getEl('editTaskProjectId').value;
     const taskId = getEl('editTaskId').value;
-    const project = projectList.find(p => String(p.id) === String(projectId));
-    if (!project) { alert('Project not found'); return; }
+    const project = projectList.find((p) => String(p.id) === String(projectId));
+    if (!project) {
+        showAlertError('Error', 'Project not found');
+        return;
+    }
 
     const code = getEl('editTaskCode').value;
     const name = getEl('editTaskName').value;
@@ -738,20 +3516,27 @@ function saveEditedTask() {
             name: name,
             description: desc,
             status: status,
-            priority: priority
+            priority: priority,
         };
         project.tasks = project.tasks || [];
         project.tasks.push(newTask);
         project.taskCount = project.tasks.length;
 
-        try { bootstrap.Modal.getInstance(getEl('editTaskModal')).hide(); } catch (e) { getEl('editTaskModal').classList.remove('active'); }
+        try {
+            bootstrap.Modal.getInstance(getEl('editTaskModal')).hide();
+        } catch (e) {
+            getEl('editTaskModal').classList.remove('active');
+        }
         showProjectTasksModal(projectId);
-        alert('Task added successfully');
+        showAlertSuccess('Success', 'Task added successfully');
         return;
     }
 
-    const taskIndex = (project.tasks || []).findIndex(t => String(t.id) === String(taskId));
-    if (taskIndex === -1) { alert('Task not found'); return; }
+    const taskIndex = (project.tasks || []).findIndex((t) => String(t.id) === String(taskId));
+    if (taskIndex === -1) {
+        showAlertError('Error', 'Task not found');
+        return;
+    }
 
     const updated = {
         ...project.tasks[taskIndex],
@@ -759,119 +3544,637 @@ function saveEditedTask() {
         name: name,
         description: desc,
         status: status,
-        priority: priority
+        priority: priority,
     };
 
     project.tasks[taskIndex] = updated;
 
-    try { bootstrap.Modal.getInstance(getEl('editTaskModal')).hide(); } catch (e) { getEl('editTaskModal').classList.remove('active'); }
+    try {
+        bootstrap.Modal.getInstance(getEl('editTaskModal')).hide();
+    } catch (e) {
+        getEl('editTaskModal').classList.remove('active');
+    }
     showProjectTasksModal(projectId);
-    alert('Task saved');
+    showAlertSuccess('Success', 'Task saved');
 }
 
-// Save changes made in the Task Detail modal: send full task JSON to update API
 async function saveTaskDetailChanges() {
     const modalRoot = document.getElementById('taskDetailModal');
-    if (!modalRoot) { alert('taskDetailModal not found'); return; }
+    if (!modalRoot) {
+        showAlertError('Error', 'taskDetailModal not found');
+        return;
+    }
 
     const projectId = modalRoot.dataset.projectId;
     const taskId = modalRoot.dataset.taskId;
 
-    let taskPayload = null;
-    if (currentTaskDetailObj && String(currentTaskDetailObj.id) === String(taskId || currentTaskDetailObj.id)) {
-        taskPayload = JSON.parse(JSON.stringify(currentTaskDetailObj));
-    } else {
-        // try to fetch the full task if we don't have it
+    let taskPayload = currentTaskDetailObj && String(currentTaskDetailObj.id) === String(taskId) 
+        ? JSON.parse(JSON.stringify(currentTaskDetailObj))
+        : null;
+
+    if (!taskPayload) {
         try {
-            const res = await fetch(`/sample-system/api/tasks/get-by-id?id=${encodeURIComponent(taskId)}`);
+            const res = await fetch(`/ppap-system/api/tasks/get-by-id?id=${encodeURIComponent(taskId)}`);
             if (res.ok) {
                 const json = await res.json();
                 taskPayload = json.data || json.result || null;
             }
-        } catch (e) {
-            console.warn('Failed to fetch full task payload before update', e);
-        }
+        } catch (e) {}
     }
 
-    if (!taskPayload) { alert('Task data not available for update'); return; }
+    if (!taskPayload) {
+        showAlertError('Error', 'Task data not available for update');
+        return;
+    }
 
-    // read selects inside modal
     const statusSelect = modalRoot.querySelector('#sl-status');
     const prioritySelect = modalRoot.querySelector('#sl-priority');
+    const driInput = document.getElementById('dri');
+    const deadlineInput = document.getElementById('deadLine');
+    const taskNameEl = modalRoot.querySelector('.task-detail-name');
+    const descEl = modalRoot.querySelector('.section-content');
+
     const newStatus = statusSelect ? statusSelect.value : taskPayload.status;
     const newPriority = prioritySelect ? prioritySelect.value : taskPayload.priority;
+    const newName = taskNameEl ? taskNameEl.textContent.trim() : taskPayload.name;
+    const newDescription = descEl ? descEl.textContent.trim() : taskPayload.description;
 
-    // Normalize 'N/A' to null (based on app conventions)
-    taskPayload.status = (newStatus === 'N/A' ? null : newStatus);
-    taskPayload.priority = (newPriority === 'N/A' ? null : newPriority);
+    let newDri = driInput ? driInput.value : taskPayload.dri;
+    let newDeadline = deadlineInput ? deadlineInput.value : taskPayload.dueDate;
+    
+    if (!newDri || newDri === 'N/A' || newDri === '-' || newDri.trim() === '') newDri = null;
+    if (!newDeadline || newDeadline === 'N/A' || newDeadline === '-' || newDeadline.trim() === '') newDeadline = null;
+    if (newDeadline) newDeadline = DateFormatter.toAPIFormat(newDeadline);
+
+    taskPayload.status = newStatus === 'N/A' ? null : newStatus;
+    taskPayload.priority = newPriority === 'N/A' ? null : newPriority;
+    taskPayload.dri = newDri;
+    taskPayload.dueDate = newDeadline;
+    taskPayload.name = newName;
+    taskPayload.description = newDescription;
+
+    const stageSelect = modalRoot.querySelector('#sl-xvt');
+    const stageVal = stageSelect?.value || taskPayload.stageId || taskPayload.stage?.id || null;
+    taskPayload.stageId = stageVal && stageVal !== 'N/A' && stageVal !== '-' ? Number(stageVal) || null : null;
+
+    const typeSelect = modalRoot.querySelector('#sl-type');
+    const typeVal = typeSelect?.value || taskPayload.processId || taskPayload.process?.id || null;
+    taskPayload.processId = typeVal && typeVal !== 'N/A' && typeVal !== '-' ? Number(typeVal) || null : null;
 
     try {
-        const res = await fetch('/sample-system/api/tasks/update', {
+        loader.load();
+
+        const res = await fetch('/ppap-system/api/tasks/update', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(taskPayload)
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(taskPayload),
         });
 
         if (!res.ok) {
-            const text = await res.text().catch(() => '');
-            console.warn('Update API returned', res.status, res.statusText, text);
-            alert('Failed to update task. Server returned ' + res.status);
+            const message = await getApiErrorMessage(res, `Failed to update task (${res.status})`);
+            showAlertError('Failed', message);
             return;
         }
 
-        let json = null;
-        try { json = await res.json(); } catch (e) { /* ignore parse */ }
-        const updatedTask = (json && (json.data || json.result)) || taskPayload;
+        const json = await res.json();
+        const updatedTask = json?.data || json?.result || taskPayload;
 
-        // update local projectList if possible
-        if (projectId && projectList && Array.isArray(projectList)) {
-            const proj = projectList.find(p => String(p.id) === String(projectId));
-            if (proj && Array.isArray(proj.tasks)) {
-                const idx = proj.tasks.findIndex(t => String(t.id) === String(taskId));
-                if (idx !== -1) {
-                    proj.tasks[idx] = { ...proj.tasks[idx], ...updatedTask };
-                }
+        if (projectId && projectList) {
+            const proj = projectList.find((p) => String(p.id) === String(projectId));
+            if (proj?.tasks) {
+                const idx = proj.tasks.findIndex((t) => String(t.id) === String(taskId));
+                if (idx !== -1) proj.tasks[idx] = {...proj.tasks[idx], ...updatedTask};
             }
         }
 
-        // update modal UI (badges and selects)
-        try {
-            const statusBadge = modalRoot.querySelector('.task-status-badge');
-            const priorityBadge = modalRoot.querySelector('.priority-badge');
-            if (statusBadge) statusBadge.textContent = updatedTask.status || '';
-            if (priorityBadge) priorityBadge.textContent = (updatedTask.priority === 0 ? '0' : (updatedTask.priority || ''));
-            if (statusSelect) statusSelect.value = updatedTask.status || (updatedTask.status === null ? 'N/A' : '');
-            if (prioritySelect) prioritySelect.value = updatedTask.priority || (updatedTask.priority === null ? 'N/A' : '');
-        } catch (e) { console.warn('Failed to refresh badges after update', e); }
+        const statusBadge = modalRoot.querySelector('.task-status-badge');
+        const priorityBadge = modalRoot.querySelector('.priority-badge');
+        const dateDisplay = modalRoot.querySelector('.date-display');
+        const assigneeDisplay = modalRoot.querySelector('.assignee-name');
 
-        try { bootstrap.Modal.getInstance(modalRoot).hide(); } catch (e) { modalRoot.classList.remove('active'); }
+        if (statusBadge) {
+            statusBadge.textContent = getStatusLabel(updatedTask.status);
+            statusBadge.className = `task-status-badge ${getStatusBadgeClass(updatedTask.status)}`;
+        }
+        if (priorityBadge) {
+            priorityBadge.textContent = getPriorityLabel(updatedTask.priority);
+            priorityBadge.className = `priority-badge ${getPriorityBadgeClass(updatedTask.priority)}`;
+        }
+        if (dateDisplay) dateDisplay.textContent = updatedTask.dueDate || updatedTask.deadline || '-';
+        if (assigneeDisplay) assigneeDisplay.textContent = getUserLabelById(updatedTask.dri) || '-';
 
-        alert('Task updated successfully');
+        if (statusSelect) statusSelect.value = updatedTask.status || 'N/A';
+        if (prioritySelect) prioritySelect.value = updatedTask.priority || 'N/A';
 
-        // refresh project tasks view if open
-        try {
-            if (projectId) showProjectTasksModal(projectId);
-        } catch (e) { /* ignore */ }
+        if (driInput) {
+            driInput.value = updatedTask.dri || '';
+            if (window.jQuery && $(driInput).data('select2')) {
+                $(driInput).val(updatedTask.dri || '').trigger('change');
+            }
+        }
+
+        if (deadlineInput) {
+            const normalized = updatedTask.dueDate 
+                ? DateFormatter.toDisplayFormat(updatedTask.dueDate)
+                : updatedTask.deadline 
+                ? DateFormatter.toDisplayFormat(updatedTask.deadline)
+                : '';
+            deadlineInput.value = normalized;
+            deadlineInput.dataset.initialValue = normalized;
+        }
+
+        currentTaskDetailObj = JSON.parse(JSON.stringify(updatedTask));
+
+        if (projectId) {
+            const project = findProjectById(projectId);
+            if (project) {
+                const activeStageId = getCurrentStageId(projectId);
+                loadProjectTasksByStage(projectId, activeStageId, {skipLoader: true});
+            }
+        }
+
+        updateTaskDetailFooterButtons(modalRoot, updatedTask.status);
+        await getComments(taskId);
+        showAlertSuccess('Success', 'Task updated successfully');
 
     } catch (e) {
-        console.error('Failed to call update API', e);
-        alert('Failed to update task: ' + e.message);
+        showAlertError('Failed', 'Failed to update task: ' + e.message);
+    } finally {
+        loader.unload();
     }
 }
 
-// Export to global scope for button onclicks
-window.saveTaskDetailChanges = saveTaskDetailChanges;
+// window.saveTaskDetailChanges = saveTaskDetailChanges;
+
+function getTaskDetailStatusValue(modalRoot) {
+    if (!modalRoot) return null;
+    const sel = modalRoot.querySelector('#sl-status') || modalRoot.querySelector('#modal-sl-status');
+    return sel ? sel.value : null;
+}
+
+function isInProgressStatus(statusVal) {
+    if (statusVal === null || statusVal === undefined) return false;
+    const s = String(statusVal).trim().toLowerCase();
+    if (!s) return false;
+    return s === 'in_progress' || s === 'in-progress' || s.includes('progress');
+}
+
+function isWaitingForApprovalStatus(statusVal) {
+    if (statusVal === null || statusVal === undefined) return false;
+    const s = String(statusVal).trim().toLowerCase();
+    if (!s) return false;
+    if (s === 'waiting_for_approval' || s === 'waiting-for-approval') return true;
+    if (s === 'waiting') return true;
+    return s.includes('waiting') && s.includes('approval');
+}
+
+function updateTaskDetailFooterButtons(modalRoot, statusVal) {
+    if (!modalRoot) return;
+
+    const btnSubmit = modalRoot.querySelector('.js-task-submit');
+    const btnReject = modalRoot.querySelector('.js-task-reject');
+    const btnApprove = modalRoot.querySelector('.js-task-approve');
+    const btnSave = modalRoot.querySelector('.js-task-save');
+
+    const waiting = isWaitingForApprovalStatus(statusVal);
+    const inProgress = isInProgressStatus(statusVal);
+
+    if (btnSubmit) btnSubmit.classList.toggle('d-none', !inProgress);
+    if (btnSave) btnSave.classList.toggle('d-none', waiting);
+    if (btnReject) btnReject.classList.toggle('d-none', !waiting);
+    if (btnApprove) btnApprove.classList.toggle('d-none', !waiting);
+}
+
+async function fetchTaskById(taskId) {
+    const res = await fetch(`/ppap-system/api/tasks/${encodeURIComponent(taskId)}`);
+    if (!res.ok) throw new Error(`Failed to fetch task: ${res.status}`);
+    const json = await res.json();
+    return json.data || json.result || null;
+}
+
+function applyTaskToDetailModal(modalRoot, task) {
+    if (!modalRoot || !task) return;
+
+    try {
+        modalRoot.dataset.taskId = String(task.id || modalRoot.dataset.taskId || '');
+        if (task.projectId !== undefined && task.projectId !== null) {
+            modalRoot.dataset.projectId = String(task.projectId);
+        }
+    } catch (e) {}
+
+    const setText = (selector, value) => {
+        const el = modalRoot.querySelector(selector);
+        if (el) el.textContent = value || '';
+    };
+
+    const taskNameEl = modalRoot.querySelector('.task-detail-name');
+    if (taskNameEl) {
+        taskNameEl.textContent = task.name || '';
+        taskNameEl.style.cursor = 'pointer';
+        taskNameEl.title = 'Click to edit';
+        taskNameEl.onclick = function (e) {
+            e.stopPropagation();
+            e.preventDefault();
+            const currentValue = this.textContent;
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = currentValue;
+            input.className = 'task-name-edit-input';
+            input.style.cssText =
+                'width: 100%; font-size: inherit; font-weight: inherit; background: var(--secondary-bg); color: var(--text-primary); border: 1px solid var(--border-color); outline: none; padding: 4px 8px; border-radius: 4px;';
+
+            const saveEdit = () => {
+                this.textContent = input.value || currentValue;
+                this.style.display = '';
+                input.remove();
+            };
+
+            input.onblur = saveEdit;
+            input.onkeydown = (e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    saveEdit();
+                }
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    this.textContent = currentValue;
+                    this.style.display = '';
+                    input.remove();
+                }
+            };
+
+            this.style.display = 'none';
+            this.parentNode.insertBefore(input, this.nextSibling);
+            input.focus();
+            input.select();
+        };
+    }
+
+    setText('.task-detail-id', task.taskCode || String(task.id || ''));
+
+    const descEl = modalRoot.querySelector('.section-content');
+    if (descEl) {
+        descEl.textContent = task.description || '';
+        descEl.style.cursor = 'pointer';
+        descEl.title = 'Click to edit';
+        descEl.onclick = function (e) {
+            e.stopPropagation();
+            e.preventDefault();
+            const currentValue = this.textContent;
+            const textarea = document.createElement('textarea');
+            textarea.value = currentValue;
+            textarea.className = 'task-desc-edit-input';
+            textarea.style.cssText =
+                'width: 100%; min-height: 100px; font-size: inherit; background: var(--secondary-bg); color: var(--text-primary); border: 1px solid var(--border-color); outline: none; padding: 8px; border-radius: 4px; resize: vertical;';
+
+            let isRemoving = false;
+            const saveEdit = () => {
+                if (isRemoving) return;
+                isRemoving = true;
+                this.textContent = textarea.value || currentValue;
+                this.style.display = '';
+                if (textarea.parentNode) textarea.remove();
+            };
+
+            textarea.onblur = saveEdit;
+            textarea.onkeydown = (e) => {
+                e.stopPropagation();
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    if (!isRemoving) {
+                        isRemoving = true;
+                        this.textContent = currentValue;
+                        this.style.display = '';
+                        if (textarea.parentNode) textarea.remove();
+                    }
+                }
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    saveEdit();
+                }
+            };
+
+            this.style.display = 'none';
+            this.parentNode.insertBefore(textarea, this.nextSibling);
+            textarea.focus();
+        };
+    }
+
+    setText('.date-display', task.dueDate || task.deadline || '-');
+    setText('.assignee-name', getUserLabelById(task.dri) || task.dri || task.assignee || '-');
+
+    const statusBadge = modalRoot.querySelector('.task-status-badge');
+    if (statusBadge) {
+        statusBadge.textContent = getStatusLabel(task.status);
+        statusBadge.className = `task-status-badge ${getStatusBadgeClass(task.status)}`;
+    }
+
+    const priorityBadge = modalRoot.querySelector('.priority-badge');
+    if (priorityBadge) {
+        priorityBadge.textContent = getPriorityLabel(task.priority);
+        priorityBadge.className = `priority-badge ${getPriorityBadgeClass(task.priority)}`;
+    }
+
+    const statusSelect = modalRoot.querySelector('#sl-status') || modalRoot.querySelector('#modal-sl-status');
+    if (statusSelect) {
+        const val =
+            task.status === null || task.status === undefined || String(task.status).trim() === ''
+                ? 'N/A'
+                : String(task.status);
+        const hasOption = Array.from(statusSelect.options).some((o) => String(o.value) === val);
+        if (!hasOption) {
+            const opt = document.createElement('option');
+            opt.value = val;
+            opt.text = val;
+            if (statusSelect.options.length > 0) statusSelect.add(opt, statusSelect.options[0]);
+            else statusSelect.add(opt);
+        }
+        statusSelect.value = val;
+    }
+
+    const prioritySelect = modalRoot.querySelector('#sl-priority') || modalRoot.querySelector('#modal-sl-priority');
+    if (prioritySelect) {
+        const val =
+            task.priority === null || task.priority === undefined || String(task.priority).trim() === ''
+                ? 'N/A'
+                : String(task.priority);
+        const hasOption = Array.from(prioritySelect.options).some((o) => String(o.value) === val);
+        if (!hasOption) {
+            const opt = document.createElement('option');
+            opt.value = val;
+            opt.text = val;
+            if (prioritySelect.options.length > 0) prioritySelect.add(opt, prioritySelect.options[0]);
+            else prioritySelect.add(opt);
+        }
+        prioritySelect.value = val;
+    }
+
+    const driSelect = document.getElementById('dri');
+    if (driSelect) {
+        if (window.jQuery && typeof $.fn.select2 === 'function' && !$(driSelect).data('select2')) {
+            initTaskDetailDriSelect2();
+        }
+        driSelect.value = task.dri || '';
+        if (window.jQuery && $(driSelect).data('select2')) {
+            $(driSelect)
+                .val(task.dri || '')
+                .trigger('change');
+        }
+    }
+
+    const deadlineInput = document.getElementById('deadLine');
+    if (deadlineInput) {
+        const normalized = task.dueDate
+            ? DateFormatter.toDisplayFormat(task.dueDate)
+            : task.deadline
+            ? DateFormatter.toDisplayFormat(task.deadline)
+            : '';
+        deadlineInput.value = normalized;
+        deadlineInput.dataset.initialValue = normalized;
+    }
+
+    try {
+        currentTaskDetailObj = JSON.parse(JSON.stringify(task));
+    } catch (e) {
+        currentTaskDetailObj = task;
+    }
+
+    const normalizedStatus = normalizeStatus(task.status);
+    const isLocked = normalizedStatus === 'WAITING_FOR_APPROVAL' || normalizedStatus === 'COMPLETED';
+
+    if (isLocked) {
+        if (statusSelect) statusSelect.disabled = true;
+        if (prioritySelect) prioritySelect.disabled = true;
+        if (driSelect) {
+            driSelect.disabled = true;
+            if (window.jQuery && $(driSelect).data('select2')) {
+                $(driSelect).prop('disabled', true).trigger('change');
+            }
+        }
+        if (deadlineInput) deadlineInput.disabled = true;
+
+        const stageSelect = modalRoot.querySelector('#sl-xvt');
+        if (stageSelect) stageSelect.disabled = true;
+
+        const typeSelect = modalRoot.querySelector('#sl-type');
+        if (typeSelect) typeSelect.disabled = true;
+
+        const uploadBtn = document.getElementById('upload');
+        if (uploadBtn) uploadBtn.disabled = true;
+
+        const saveBtn = modalRoot.querySelector('.js-task-save');
+        if (saveBtn) saveBtn.disabled = true;
+    } else {
+        if (statusSelect) statusSelect.disabled = false;
+        if (prioritySelect) prioritySelect.disabled = false;
+        if (driSelect) {
+            driSelect.disabled = false;
+            if (window.jQuery && $(driSelect).data('select2')) {
+                $(driSelect).prop('disabled', false).trigger('change');
+            }
+        }
+        if (deadlineInput) deadlineInput.disabled = false;
+
+        const stageSelect = modalRoot.querySelector('#sl-xvt');
+        if (stageSelect) stageSelect.disabled = false;
+
+        const typeSelect = modalRoot.querySelector('#sl-type');
+        if (typeSelect) typeSelect.disabled = false;
+
+        const uploadBtn = document.getElementById('upload');
+        if (uploadBtn) uploadBtn.disabled = false;
+
+        const saveBtn = modalRoot.querySelector('.js-task-save');
+        if (saveBtn) saveBtn.disabled = false;
+    }
+}
+
+function wireTaskDetailWorkflowActions(modalRoot) {
+    if (!modalRoot) return;
+    if (modalRoot.dataset.workflowWired === '1') return;
+    modalRoot.dataset.workflowWired = '1';
+
+    const statusSelect = modalRoot.querySelector('#sl-status') || modalRoot.querySelector('#modal-sl-status');
+    if (statusSelect) {
+        statusSelect.addEventListener('change', function () {
+            updateTaskDetailFooterButtons(modalRoot, this.value);
+        });
+    }
+
+    const withDisabled = async (btn, fn) => {
+        if (!btn) return fn();
+        const prev = btn.disabled;
+        btn.disabled = true;
+        try {
+            return await fn();
+        } finally {
+            btn.disabled = prev;
+        }
+    };
+
+    const postAction = async (action, payload) => {
+        const taskId = modalRoot.dataset.taskId;
+        if (!taskId) {
+            showAlertError('Error', 'Task ID is required');
+            return;
+        }
+
+        try {
+            if (typeof loader !== 'undefined' && loader && typeof loader.load === 'function') loader.load();
+            const endpoint =
+                action === 'reject'
+                    ? `/ppap-system/api/tasks/${encodeURIComponent(taskId)}/reject`
+                    : `/ppap-system/api/tasks/${encodeURIComponent(taskId)}/${action}`;
+
+            const fetchOptions = {
+                method: 'POST',
+            };
+
+            if (payload !== undefined) {
+                fetchOptions.headers = {
+                    'Content-Type': 'application/json',
+                };
+                fetchOptions.body = JSON.stringify(payload);
+            }
+
+            const res = await fetch(endpoint, fetchOptions);
+            if (!res.ok) {
+                const message = await getApiErrorMessage(res, `Failed to ${action} task (${res.status})`);
+                showAlertError('Failed', message);
+                return;
+            }
+
+            const updated = await fetchTaskById(taskId);
+            if (updated) {
+                applyTaskToDetailModal(modalRoot, updated);
+                updateTaskDetailFooterButtons(modalRoot, updated.status);
+
+                const projectId = modalRoot.dataset.projectId;
+                if (projectId && projectList && Array.isArray(projectList)) {
+                    const proj = projectList.find((p) => String(p.id) === String(projectId));
+                    if (proj && Array.isArray(proj.tasks)) {
+                        const idx = proj.tasks.findIndex((t) => String(t.id) === String(taskId));
+                        if (idx !== -1) {
+                            proj.tasks[idx] = {...proj.tasks[idx], ...updated};
+                        }
+                    }
+                }
+
+                if (projectId) {
+                    const project = findProjectById(projectId);
+                    if (project) {
+                        const activeStageId = getCurrentStageId(projectId);
+                        loadProjectTasksByStage(projectId, activeStageId, {skipLoader: true});
+                    }
+                }
+
+                try {
+                    await getComments(taskId);
+                } catch (e) {}
+            }
+
+            showAlertSuccess('Success', `Task ${action} successfully`);
+        } catch (e) {
+            console.error(`Task ${action} error`, e);
+            showAlertError('Failed', `Failed to ${action} task`);
+        } finally {
+            if (typeof loader !== 'undefined' && loader && typeof loader.unload === 'function') loader.unload();
+        }
+    };
+
+    const btnSubmit = modalRoot.querySelector('.js-task-submit');
+    const btnReject = modalRoot.querySelector('.js-task-reject');
+    const btnApprove = modalRoot.querySelector('.js-task-approve');
+
+    if (btnSubmit) {
+        btnSubmit.addEventListener('click', function () {
+            return withDisabled(btnSubmit, async () => {
+                if (window.Swal) {
+                    const result = await Swal.fire({
+                        title: 'Submit task',
+                        text: 'Are you sure you want to submit this task?',
+                        icon: 'question',
+                        showCancelButton: true,
+                        confirmButtonText: 'Submit',
+                        cancelButtonText: 'Cancel',
+                    });
+                    if (!result.isConfirmed) return;
+                }
+                await postAction('submit');
+            });
+        });
+    }
+
+    if (btnReject) {
+        btnReject.addEventListener('click', function () {
+            return withDisabled(btnReject, async () => {
+                let reasonPayload;
+                if (window.Swal) {
+                    const modal = document.querySelector('#taskDetailModal');
+                    const result = await Swal.fire({
+                        target: modal,
+                        title: 'Reject task',
+                        text: 'Are you sure you want to reject this task?',
+                        icon: 'warning',
+                        input: 'textarea',
+                        inputPlaceholder: 'Enter reject reason',
+                        inputAttributes: {
+                            'aria-label': 'Rejection reason',
+                            maxlength: '1000',
+                        },
+                        showCancelButton: true,
+                        confirmButtonText: 'Reject',
+                        cancelButtonText: 'Cancel',
+                        focusConfirm: false,
+                    });
+                    if (!result.isConfirmed) return;
+                    const reasonValue = result.value ? String(result.value).trim() : '';
+                    if (reasonValue) {
+                        reasonPayload = {reason: reasonValue};
+                    }
+                }
+                await postAction('reject', reasonPayload);
+            });
+        });
+    }
+
+    if (btnApprove) {
+        btnApprove.addEventListener('click', function () {
+            return withDisabled(btnApprove, async () => {
+                if (window.Swal) {
+                    const result = await Swal.fire({
+                        title: 'Approve task',
+                        text: 'Are you sure you want to approve this task?',
+                        icon: 'question',
+                        showCancelButton: true,
+                        confirmButtonText: 'Approve',
+                        cancelButtonText: 'Cancel',
+                    });
+                    if (!result.isConfirmed) return;
+                }
+                await postAction('approve');
+            });
+        });
+    }
+}
 
 async function saveProjectTaskQuantity() {
     const pidEl = getEl('pt_detail_projectId');
     let project = null;
-    if (pidEl && pidEl.value) project = projectList.find(p => String(p.id) === String(pidEl.value));
+    if (pidEl && pidEl.value) project = projectList.find((p) => String(p.id) === String(pidEl.value));
     if (!project) {
         const projName = getEl('pt_detail_projectName') ? getElValue(getEl('pt_detail_projectName')) : null;
-        if (!projName) { alert('Project not found'); return; }
-        project = projectList.find(p => p.name === projName);
+        if (!projName) {
+            showAlertError('Error', 'Project not found');
+            return;
+        }
+        project = projectList.find((p) => p.name === projName);
     }
-    if (!project) { alert('Project not found'); return; }
+    if (!project) {
+        showAlertError('Error', 'Project not found');
+        return;
+    }
 
     const dCustomer = getEl('pt_detail_customer');
     const dProject = getEl('pt_detail_projectName');
@@ -890,34 +4193,53 @@ async function saveProjectTaskQuantity() {
     if (v !== null && !isNaN(v) && v >= 0) project.taskCount = v;
 
     try {
-        const tasksToSave = Array.isArray(project.tasks) ? project.tasks.map(item => ({
-            name: item.name || item.taskName || '',
-            description: item.description || '',
-            taskCode: item.taskCode || item.id || '',
-            processId: item.processId || null,
-            typeId: item.typeId || null,
-            departmentId: item.departmentId || null,
-            priority: item.priority || null,
-            dri: item.dri || null,
-            dueDate: item.dueDate || item.deadline || null
-        })) : [];
+        const projectIdValue = project && project.id ? project.id : pidEl ? pidEl.value : null;
+        const stageId =
+            (projectIdValue && STANDARD_PPAP_STAGE_BY_PROJECT[String(projectIdValue)]) ||
+            (projectIdValue ? getCurrentStageId(projectIdValue) : null);
+        const sourceTasks = Array.isArray(project.tasks) ? project.tasks : [];
+        const scopedTasks = stageId ? getStageTasksFromList(sourceTasks, stageId) : sourceTasks;
+        const taskIds = scopedTasks.map((item) => String(item.id)).filter((id) => id && String(id).trim() !== '');
 
-        if (tasksToSave.length > 0) {
-            const customerIdForSave = mapCustomerToId(project.customer);
-            const saveOk = await saveTasksForProject(tasksToSave, customerIdForSave, project.name);
-            if (!saveOk) {
+        if (taskIds.length > 0) {
+            const resolvedId = await ensureProjectPersisted(project);
+            if (!resolvedId) {
+                showAlertError('Failed', 'Unable to save tasks for project: project id not found on server');
             } else {
-                alert('Project details and tasks updated successfully');
+                const customerIdForSave = mapCustomerToId(project.customer);
+                const saveOk = await saveTasksForProject(
+                    taskIds,
+                    customerIdForSave,
+                    project.name,
+                    resolvedId,
+                    stageId
+                );
+                if (saveOk) {
+                    showAlertSuccess('Success', 'Project details and tasks updated successfully');
+                    if (stageId) delete STANDARD_PPAP_STAGE_BY_PROJECT[String(resolvedId)];
+                    await loadProjectList();
+                    try {
+                        if (project && project.id) {
+                            await showProjectTasksModal(project.id);
+                        }
+                    } catch (e) {}
+                }
             }
         } else {
-            alert('Project details updated successfully (no tasks to save)');
+            showAlertSuccess('Success', 'Project details updated successfully');
+            await loadProjectList();
+            try {
+                if (project && project.id) {
+                    await showProjectTasksModal(project.id);
+                } else {
+                    renderProjectTasksContent(project.tasks || [], project.id || '');
+                }
+            } catch (e) {}
         }
     } catch (e) {
         console.error('Error while saving project tasks:', e);
-        alert('Project details updated locally but saving tasks failed. See console for details.');
+        showAlertError('Error', 'Project details updated locally but saving tasks failed. See console for details.');
     }
-
-    loadProjectList();
 }
 
 function showAddTaskModal(projectId) {
@@ -927,11 +4249,14 @@ function showAddTaskModal(projectId) {
         if (pidEl && pidEl.value) pid = pidEl.value;
         else {
             const projName = getEl('pt_detail_projectName') ? getElValue(getEl('pt_detail_projectName')) : null;
-            const p = projectList.find(pp => pp.name === projName);
+            const p = projectList.find((pp) => pp.name === projName);
             pid = p ? p.id : null;
         }
     }
-    if (!pid) { alert('Project not found'); return; }
+    if (!pid) {
+        showAlertError('Error', 'Project not found');
+        return;
+    }
 
     getEl('editTaskProjectId').value = pid;
     getEl('editTaskId').value = '';
@@ -941,91 +4266,104 @@ function showAddTaskModal(projectId) {
     getEl('editTaskStatus').value = '';
     getEl('editTaskPriority').value = '';
 
-    try { new bootstrap.Modal(document.getElementById('editTaskModal')).show(); }
-    catch (e) { const el = document.getElementById('editTaskModal'); if (el) el.classList.add('active'); }
+    try {
+        new bootstrap.Modal(document.getElementById('editTaskModal')).show();
+    } catch (e) {
+        const el = document.getElementById('editTaskModal');
+        if (el) el.classList.add('active');
+    }
 }
 
 async function removeTaskFromProject(projectId, taskId) {
-    const project = projectList.find(p => String(p.id) === String(projectId));
+    const project = projectList.find((p) => String(p.id) === String(projectId));
     if (!project) return;
 
-    if (!confirm('Bạn có chắc muốn xóa task này?')) return;
+    if (!confirm('Do you want to delete ?')) return;
 
     try {
-        const res = await fetch(`/sample-system/api/tasks/delete?id=${encodeURIComponent(taskId)}`, {
-            method: 'POST'
+        const res = await fetch(`/ppap-system/api/tasks/delete?id=${encodeURIComponent(taskId)}`, {
+            method: 'POST',
         });
 
         if (!res.ok) {
-            console.warn('Failed to delete task on server', res.status, res.statusText);
-            try {
-                const text = await res.text();
-                console.warn('Response body:', text);
-            } catch (e) { }
-            alert('Failed to delete task on server.');
+            const message = await getApiErrorMessage(res, `Failed to delete task (${res.status})`);
+            showAlertError('Failed', message);
             return;
         }
 
         let json = null;
-        try { json = await res.json(); } catch (e) { /* not JSON, ignore */ }
+        try {
+            json = await res.json();
+        } catch (e) {}
 
-        const serverOk = json ? (json.status === 'OK' || json.success === true || json.result === 'OK') : true;
+        const serverOk = json ? json.status === 'OK' || json.success === true || json.result === 'OK' : true;
         if (!serverOk) {
-            alert('Server reported failure when deleting task.');
+            const message = extractApiMessage(json) || 'Server reported failure when deleting task.';
+            showAlertError('Failed', message);
             return;
         }
 
-        // Update local data
-        project.tasks = (project.tasks || []).filter(t => String(t.id) !== String(taskId));
+        project.tasks = (project.tasks || []).filter((t) => String(t.id) !== String(taskId));
         project.taskCount = project.tasks.length;
-        
-        // Refresh the project list in the background
-        loadProjectList();
-        
-        // Refresh only the modal content without closing/reopening the modal
-        const container = document.getElementById('projectTasksContent');
-        if (container) {
-            renderProjectTasksContent(project.tasks, projectId);
-        }
+
+        const activeStageId = getCurrentStageId(projectId);
+        loadProjectTasksByStage(projectId, activeStageId, {skipLoader: true});
     } catch (e) {
-        console.error('Error while deleting task:', e);
-        alert('Error while deleting task. See console for details.');
+        console.error('Error', e);
+        showAlertError('Error', 'Error while deleting task. See console for details.');
     }
 }
 
 async function projectTasksSubmit() {
     const pidEl = getEl('pt_detail_projectId');
     if (!pidEl || !pidEl.value) {
-        alert('Project ID not found');
+        showAlertWarning('Warning', 'Project ID not found');
         return;
     }
 
     const projectId = parseInt(pidEl.value, 10);
     if (isNaN(projectId)) {
-        alert('Invalid project ID');
+        showAlertWarning('Warning', 'Invalid project ID');
+        return;
+    }
+
+    const result = await Swal.fire({
+        title: 'Submit Project',
+        text: 'Are you sure you want to submit this project?',
+        icon: 'question',
+        showCancelButton: true,
+        confirmButtonText: 'Submit',
+        cancelButtonText: 'Cancel',
+    });
+
+    if (!result.isConfirmed) {
         return;
     }
 
     try {
-        const res = await fetch(`/sample-system/api/projects/submit?id=${projectId}`, {
-            method: 'POST'
+        const res = await fetch(`/ppap-system/api/projects/submit?id=${projectId}`, {
+            method: 'POST',
         });
 
         if (!res.ok) {
-            throw new Error(`Submit failed: ${res.status} ${res.statusText}`);
+            const message = await getApiErrorMessage(res, `Submit failed (${res.status})`);
+            throw new Error(message);
         }
 
         let json = null;
-        try { json = await res.json(); } catch (e) { /* ignore */ }
+        try {
+            json = await res.json();
+        } catch (e) {}
 
-        const success = json ? (json.status === 'OK' || json.success === true) : true;
+        const success = json ? json.status === 'OK' || json.success === true : true;
 
         if (!success) {
-            alert('Server reported failure when submitting project');
+            const message = extractApiMessage(json) || 'Server reported failure when submitting project';
+            showAlertError('Failed', message);
             return;
         }
 
-        const project = projectList.find(p => String(p.id) === String(projectId));
+        const project = projectList.find((p) => String(p.id) === String(projectId));
         if (project) {
             project.status = 'submitted';
             loadProjectList();
@@ -1038,23 +4376,25 @@ async function projectTasksSubmit() {
             if (el) el.classList.remove('active');
         }
 
-        alert('Project submitted successfully');
-
+        showAlertSuccess('Success', 'Project submitted successfully');
     } catch (e) {
         console.error('Failed to submit project:', e);
-        alert('Failed to submit project. Please try again.');
+        showAlertError('Failed', e && e.message ? e.message : 'Failed to submit project. Please try again.');
     }
 }
 
 function openTaskDetailFromProject(taskId) {
     const modalEl = document.getElementById('taskDetailModal');
-    if (!modalEl) { alert('taskDetailModal not found'); return; }
+    if (!modalEl) {
+        showAlertError('Error', 'Modal not found');
+        return;
+    }
 
     if (modalEl.parentElement !== document.body) document.body.appendChild(modalEl);
 
     const elems = Array.from(document.querySelectorAll('.modal, .modal-backdrop'));
     let highest = 1040;
-    elems.forEach(el => {
+    elems.forEach((el) => {
         const z = window.getComputedStyle(el).zIndex;
         const zi = parseInt(z, 10);
         if (!isNaN(zi) && zi > highest) highest = zi;
@@ -1071,19 +4411,25 @@ function openTaskDetailFromProject(taskId) {
                 const lastBackdrop = backdrops[backdrops.length - 1];
                 lastBackdrop.style.zIndex = backdropZ;
             }
-        } catch (e) {
-            console.warn('Failed to adjust modal stacking', e);
-        }
+        } catch (e) {}
         modalEl.removeEventListener('shown.bs.modal', onShown);
     }
     modalEl.addEventListener('shown.bs.modal', onShown);
 
     if (typeof window.showTaskDetail === 'function') {
-        try { window.showTaskDetail(taskId); } catch (e) { console.warn('showTaskDetail failed', e); }
+        try {
+            window.showTaskDetail(taskId);
+        } catch (e) {}
     } else if (typeof window.openPermissionTask === 'function') {
-        try { window.openPermissionTask('', taskId, ''); } catch (e) { console.warn('openPermissionTask failed', e); }
+        try {
+            window.openPermissionTask('', taskId, '');
+        } catch (e) {}
     } else {
-        try { new bootstrap.Modal(modalEl).show(); } catch (e) { modalEl.classList.add('active'); }
+        try {
+            new bootstrap.Modal(modalEl).show();
+        } catch (e) {
+            modalEl.classList.add('active');
+        }
     }
 }
 
@@ -1103,7 +4449,10 @@ function showCreateProjectForm() {
     currentProject = null;
     selectedPPAPItems = [];
     const metaEl = getEl('createProjectModalMeta');
-    if (metaEl) { metaEl.textContent = ''; if (metaEl.style) metaEl.style.display = 'none'; }
+    if (metaEl) {
+        metaEl.textContent = '';
+        if (metaEl.style) metaEl.style.display = 'none';
+    }
     renderSelectedTasksInModal();
 
     safeSetDisplay('createProjectStep1', 'block');
@@ -1121,7 +4470,7 @@ function showCreateProjectForm() {
     try {
         const labelEl = getEl('createProjectModalLabel');
         if (labelEl && !createModalOriginalTitleHTML) createModalOriginalTitleHTML = labelEl.innerHTML;
-    } catch (e) { }
+    } catch (e) {}
 }
 
 function cancelCreateProject() {
@@ -1149,45 +4498,62 @@ function closeCreateProjectModal() {
         console.error('Failed to close create project modal', e);
     }
     const metaEl = getEl('createProjectModalMeta');
-    if (metaEl) { metaEl.textContent = ''; if (metaEl.style) metaEl.style.display = 'none'; }
+    if (metaEl) {
+        metaEl.textContent = '';
+        if (metaEl.style) metaEl.style.display = 'none';
+    }
     resetToProjectList();
 }
 
-function saveProjectBasicInfoModal() {
+async function saveProjectBasicInfoModal() {
     const customer = document.getElementById('newProjectCustomer').value;
     const name = document.getElementById('newProjectName').value;
+    const cftId = document.getElementById('newProjectCft').value;
+    const product = document.getElementById('newProjectProduct').value.trim();
+    const model = document.getElementById('newProjectModel').value.trim();
 
-    if (!customer || !name) {
-        alert('Please fill all required fields (Customer, Project Name)');
+    if (!customer || !name || !product || !model || !cftId) {
+        showAlertWarning(
+            'Warning',
+            'Please fill all required fields (Customer, Project Name, CFT Team, Product, Model)'
+        );
+        return;
+    }
+
+    const created = await createProject(customer, name, product, model, cftId);
+
+    if (!created) {
+        showAlertError('Failed', 'Please try again.');
         return;
     }
 
     currentProject = {
-        id: generateProjectId(),
-        customer: customer,
-        name: name,
-        createdDate: new Date().toISOString().split('T')[0],
-        status: 'draft',
-        taskCount: 0
+        id: created.id || created.projectId,
+        customer: created.customerId || customer,
+        name: created.name || name,
+        createdDate: created.createdAt ? created.createdAt.split(' ')[0] : new Date().toISOString().split('T')[0],
+        status: created.status || 'draft',
+        taskCount: 0,
+        tasks: [],
+        cftId: created.cftId || cftId,
+        product: created.product || product,
+        model: created.model || model,
     };
 
-    safeSetDisplay('createProjectStep1', 'none');
-    safeSetDisplay('createProjectStep2', 'block');
-    safeSetDisplay('createBackBtn', 'inline-flex');
-    safeSetDisplay('createNextBtn', 'none');
-    safeSetDisplay('createSaveBtn', 'inline-flex');
-
-    const metaEl = getEl('createProjectModalMeta');
-    if (metaEl) { metaEl.textContent = `${customer} - ${name}`; if (metaEl.style) metaEl.style.display = 'inline'; }
-
-    const labelEl = getEl('createProjectModalLabel');
-    if (labelEl) {
-        labelEl.innerHTML = `<span><i class="bi bi-plus-square"></i></span><span>Create ${customer} - ${name}</span>`;
+    const existingIndex = projectList.findIndex((p) => String(p.id) === String(currentProject.id));
+    if (existingIndex !== -1) {
+        projectList[existingIndex] = currentProject;
+    } else {
+        projectList.push(currentProject);
     }
 
-    alert('Basic info saved');
+    const projectId = currentProject.id;
 
-    renderSelectedTasksInModal();
+    await loadProjectList();
+
+    showAlertSuccess('Success', 'Project created successfully!');
+    closeCreateProjectModal();
+    await showProjectTasksModal(projectId);
 }
 
 function createModalBackToStep1() {
@@ -1197,64 +4563,60 @@ function createModalBackToStep1() {
     safeSetDisplay('createNextBtn', 'inline-flex');
     safeSetDisplay('createSaveBtn', 'none');
     const metaEl = getEl('createProjectModalMeta');
-    if (metaEl) { metaEl.textContent = ''; if (metaEl.style) metaEl.style.display = 'none'; }
+    if (metaEl) {
+        metaEl.textContent = '';
+        if (metaEl.style) metaEl.style.display = 'none';
+    }
     const labelEl = getEl('createProjectModalLabel');
     if (labelEl && createModalOriginalTitleHTML) labelEl.innerHTML = createModalOriginalTitleHTML;
 }
 
 async function submitProjectFromModal() {
-    if (!currentProject) { alert('Please save basic project info first'); return; }
-    if (!selectedPPAPItems || selectedPPAPItems.length === 0) { alert('Please select at least one PPAP item or add a custom task'); return; }
+    if (!currentProject || !currentProject.id) {
+        return;
+    }
 
-    currentProject.taskCount = selectedPPAPItems.length;
-    currentProject.status = 'waiting';
+    if (!selectedPPAPItems || selectedPPAPItems.length === 0) {
+        showAlertWarning('Warning', 'Please select at least one task');
+        return;
+    }
 
-    const created = await createProject(currentProject.customer, currentProject.name);
-    if (created) {
-        const finalProject = Object.assign({}, created || {}, {
-            tasks: selectedPPAPItems.slice(),
-            taskCount: selectedPPAPItems.length,
-            status: 'waiting'
-        });
+    const taskIds = selectedPPAPItems.map((item) => String(item.id)).filter((id) => id && String(id).trim() !== '');
 
-        finalProject.tasks = selectedPPAPItems.map(item => ({
-            ...item,
-            projectId: finalProject.id
-        }));
-
-        if (!finalProject.name && currentProject && currentProject.name) finalProject.name = currentProject.name;
-
-        const tasksPayload = selectedPPAPItems.map(item => ({
-            name: item.name || item.taskName || '',
-            description: item.description || '',
-            taskCode: item.taskCode || item.id || '',
-            processId: item.processId || null,
-            typeId: item.typeId || null,
-            departmentId: item.departmentId || null,
-            priority: item.priority || null,
-            dri: item.dri || null,
-            dueDate: item.dueDate || item.deadline || null
-        }));
-
-        const customerIdForSave = mapCustomerToId(finalProject.customer || currentProject.customer);
-        const saveOk = await saveTasksForProject(tasksPayload, customerIdForSave, finalProject.name || currentProject.name);
-        if (!saveOk) {
-            console.warn('Tasks were not persisted to server. They may be lost after reload.');
+    try {
+        const resolvedId = await ensureProjectPersisted(currentProject);
+        if (!resolvedId) {
+            showAlertError('Failed', 'Please try again');
+            return;
         }
 
-        projectList.push(finalProject);
+        const customerIdForSave = mapCustomerToId(currentProject.customer);
+        const saveOk = await saveTasksForProject(taskIds, customerIdForSave, currentProject.name, resolvedId, null);
+        if (!saveOk) {
+            showAlertError('Failed', 'Failed to add tasks. Please try again.');
+            return;
+        }
 
-        alert(`Project "${finalProject.name || currentProject.name || 'N/A'}" created successfully, containing ${selectedPPAPItems.length} tasks`);
+        currentProject.tasks = selectedPPAPItems.slice();
+        currentProject.taskCount = selectedPPAPItems.length;
 
-        const labelEl = getEl('createProjectModalLabel');
-        if (labelEl && createModalOriginalTitleHTML) labelEl.innerHTML = createModalOriginalTitleHTML;
+        const existingIndex = projectList.findIndex((p) => String(p.id) === String(currentProject.id));
+        if (existingIndex !== -1) {
+            projectList[existingIndex] = currentProject;
+        } else {
+            projectList.push(currentProject);
+        }
+
+        showAlertSuccess(
+            'Success',
+            `Project "${currentProject.name}" saved successfully with ${selectedPPAPItems.length} tasks.`
+        );
 
         closeCreateProjectModal();
-        safeSetDisplay('projectListSection', 'block');
-        safeSetDisplay('createProjectSection', 'none');
-        renderProjectListUI();
-    } else {
-        alert('Failed to create project. Please try again.');
+        await loadProjectList();
+    } catch (e) {
+        console.error('Failed to submit project:', e);
+        showAlertError('Failed', 'Failed to submit project. Please try again.');
     }
 }
 
@@ -1263,7 +4625,7 @@ function renderSelectedTasksInModal() {
     if (!container) return;
     if (!selectedPPAPItems || selectedPPAPItems.length === 0) {
         container.innerHTML = `
-            <table class="task-list-table">
+            <table class="table">
                 <thead>
                     <tr>
                         <th>ID</th>
@@ -1289,7 +4651,7 @@ function renderSelectedTasksInModal() {
         <h5 style="margin-bottom: 12px; color: var(--text-primary);">
             <i class="bi bi-list-task"></i> List Tasks
         </h5>
-        <table id="selectedTasksTable" class="task-list-table">
+        <table id="selectedTasksTable" class="table">
             <thead>
                 <tr>
                     <th>ID</th>
@@ -1306,12 +4668,13 @@ function renderSelectedTasksInModal() {
             <tbody>
     `;
 
-    const rows = selectedPPAPItems.map(item => {
-        const projectText = currentProject ? (currentProject.customer || '') : '';
-        const stage = item.stage || '';
-        const dri = item.dri || '';
-        const deadline = item.deadline || '';
-        return `
+    const rows = selectedPPAPItems
+        .map((item) => {
+            const projectText = currentProject ? currentProject.customer || '' : '';
+            const stage = getStageName(item.stageId) || item.stage || item.stageName || '';
+            const dri = item.dri || '';
+            const deadline = item.deadline || '';
+            return `
             <tr draggable="true" data-task-id="${item.id}">
                 <td class="task-id-cell">${item.id}</td>
                 <td>${item.name || ''}</td>
@@ -1321,10 +4684,13 @@ function renderSelectedTasksInModal() {
                 <td>${item.priority || ''}</td>
                 <td>${dri}</td>
                 <td>${deadline}</td>
-                <td style="text-align:center"><button class="action-btn-sm" onclick="removeSelectedTask('${item.id}')" title="Remove"><i class="bi bi-trash"></i></button></td>
+                <td style="text-align:center"><button class="action-btn-sm" onclick="removeSelectedTask('${
+                    item.id
+                }')" title="Remove"><i class="bi bi-trash"></i></button></td>
             </tr>
         `;
-    }).join('');
+        })
+        .join('');
 
     const footer = `
             </tbody>
@@ -1336,14 +4702,18 @@ function renderSelectedTasksInModal() {
 }
 
 function removeSelectedTask(taskId) {
-    selectedPPAPItems = selectedPPAPItems.filter(t => String(t.id) !== String(taskId));
+    selectedPPAPItems = selectedPPAPItems.filter((t) => String(t.id) !== String(taskId));
     renderSelectedTasksInModal();
 }
 
-let draggedTaskRow = null;
 function initSelectedTasksDragAndDrop() {
     const rows = document.querySelectorAll('#selectedTasksTable tbody tr');
-    rows.forEach(row => {
+    rows.forEach((row) => {
+        row.removeEventListener('dragstart', handleTaskDragStart);
+        row.removeEventListener('dragover', handleTaskDragOver);
+        row.removeEventListener('drop', handleTaskDrop);
+        row.removeEventListener('dragend', handleTaskDragEnd);
+
         row.addEventListener('dragstart', handleTaskDragStart);
         row.addEventListener('dragover', handleTaskDragOver);
         row.addEventListener('drop', handleTaskDrop);
@@ -1386,45 +4756,60 @@ function handleTaskDrop(e) {
     }
 
     const tbody = document.querySelector('#selectedTasksTable tbody');
-    const newOrder = Array.from(tbody.querySelectorAll('tr')).map(tr => tr.dataset.taskId);
+    const newOrder = Array.from(tbody.querySelectorAll('tr')).map((tr) => tr.dataset.taskId);
     const map = {};
-    selectedPPAPItems.forEach(item => { if (item && item.id) map[String(item.id)] = item; });
-    selectedPPAPItems = newOrder.map(id => map[String(id)]).filter(Boolean);
+    selectedPPAPItems.forEach((item) => {
+        if (item && item.id) map[String(item.id)] = item;
+    });
+    selectedPPAPItems = newOrder.map((id) => map[String(id)]).filter(Boolean);
 
-    document.querySelectorAll('#selectedTasksTable tbody tr').forEach(r => { r.style.borderTop = ''; r.style.borderBottom = ''; });
+    document.querySelectorAll('#selectedTasksTable tbody tr').forEach((r) => {
+        r.style.borderTop = '';
+        r.style.borderBottom = '';
+    });
 
     return false;
 }
 
 function handleTaskDragEnd(e) {
     this.style.opacity = '1';
-    document.querySelectorAll('#selectedTasksTable tbody tr').forEach(r => { r.style.borderTop = ''; r.style.borderBottom = ''; });
+    document.querySelectorAll('#selectedTasksTable tbody tr').forEach((r) => {
+        r.style.borderTop = '';
+        r.style.borderBottom = '';
+    });
     draggedTaskRow = null;
 }
 
 function saveProjectBasicInfo() {
     const customer = document.getElementById('newProjectCustomer').value;
     const name = document.getElementById('newProjectName').value;
+    const cftId = document.getElementById('newProjectCft').value;
+    const product = document.getElementById('newProjectProduct').value.trim();
+    const model = document.getElementById('newProjectModel').value.trim();
 
-    if (!customer || !name) {
-        alert('Please fill all required fields (Customer, Project Name)');
+    if (!customer || !name || !product || !model || !cftId) {
+        showAlertWarning(
+            'Warning',
+            'Please fill all required fields (Customer, Project Name, CFT Team, Product, Model)'
+        );
         return;
     }
 
     currentProject = {
-        id: generateProjectId(), // Temp ID
+        id: generateProjectId(),
         customer: customer,
         name: name,
         createdDate: new Date().toISOString().split('T')[0],
         status: 'draft',
-        taskCount: 0
+        taskCount: 0,
+        cftId: cftId,
+        product: product,
+        model: model,
     };
-
 
     safeSetDisplay('createProjectSection', 'none');
     safeSetDisplay('operationOptionsSection', 'block');
 }
-
 
 function generateProjectId() {
     return 'TEMP-' + Date.now();
@@ -1437,104 +4822,188 @@ function cancelProjectCreation() {
 }
 
 async function submitProject() {
-    if (!currentProject) { alert('Please save basic project info first'); return; }
-    if (selectedPPAPItems.length === 0) { alert('Please select at least one PPAP item or add a custom task'); return; }
+    if (!currentProject) {
+        showAlertWarning('Warning', 'Please save basic project info first');
+        return;
+    }
+    if (selectedPPAPItems.length === 0) {
+        showAlertWarning('Warning', 'Please select at least one PPAP item or add a custom task');
+        return;
+    }
 
     currentProject.taskCount = selectedPPAPItems.length;
     currentProject.status = 'waiting';
+    const taskIds = selectedPPAPItems.map((item) => String(item.id)).filter((id) => id && String(id).trim() !== '');
 
-    const created = await createProject(currentProject.customer, currentProject.name);
-    if (created) {
-        currentProject.id = created.id;
-        const tasksPayload = selectedPPAPItems.map(item => ({
-            name: item.name || item.taskName || '',
-            description: item.description || '',
-            taskCode: item.taskCode || item.id || '',
-            processId: item.processId || null,
-            typeId: item.typeId || null,
-            departmentId: item.departmentId || null,
-            priority: item.priority || null,
-            dri: item.dri || null,
-            dueDate: item.dueDate || item.deadline || null
-        }));
-
-        const customerIdForSave = mapCustomerToId(currentProject.customer);
-        const saveOk = await saveTasksForProject(tasksPayload, customerIdForSave, currentProject.name);
-        if (!saveOk) {
-            console.warn('Tasks were not persisted to server. They may be lost after reload.');
-            alert('Project created but saving tasks failed. Tasks may be lost after reload.');
-        }
-
-        projectList.push(currentProject);
-        alert(`Project "${currentProject.name}" created successfully, containing ${currentProject.taskCount} tasks`);
-        resetToProjectList();
-        loadProjectList();
+    let resolvedId = null;
+    if (currentProject.id && !String(currentProject.id).startsWith('TEMP-')) {
+        resolvedId = currentProject.id;
     } else {
-        alert('Failed to create project');
+        const created = await createProject(
+            currentProject.customer,
+            currentProject.name,
+            currentProject.product,
+            currentProject.model,
+            currentProject.cftId
+        );
+        if (created && created.id) {
+            currentProject.id = created.id;
+            resolvedId = created.id;
+        } else {
+            showAlertError('Failed', 'Failed to create project on server. Please try again.');
+            return;
+        }
     }
+
+    const customerIdForSave = mapCustomerToId(currentProject.customer);
+    const saveOk = await saveTasksForProject(taskIds, customerIdForSave, currentProject.name, resolvedId, null);
+    if (!saveOk) {
+        showAlertError('Failed', 'Saving tasks to project failed. Please try again.');
+        return;
+    }
+
+    const existingIndex = projectList.findIndex((p) => String(p.id) === String(currentProject.id));
+    if (existingIndex !== -1) {
+        projectList[existingIndex] = currentProject;
+    } else {
+        projectList.push(currentProject);
+    }
+
+    showAlertSuccess(
+        'Success',
+        `Project "${currentProject.name}" saved successfully, containing ${currentProject.taskCount} tasks`
+    );
+    resetToProjectList();
+    await loadProjectList();
 }
 
 async function showStandardPPAP() {
-    const modal = document.getElementById("standardPPAPModal");
-    const grid = document.getElementById("ppapTasksGrid");
+    const modal = document.getElementById('standardPPAPModal');
+    const grid = document.getElementById('ppapTasksGrid');
 
-    if (grid) grid.innerHTML = '<div class="ppap-loading">載入中...</div>';
+    if (grid) grid.innerHTML = '<div class="ppap-loading">載入中..</div>';
+
+    const pidEl = getEl('pt_detail_projectId');
+    const projectId = pidEl && pidEl.value ? String(pidEl.value) : null;
+    const activeStageId = projectId ? getCurrentStageId(projectId) : null;
+    currentStandardPpapStageId = activeStageId;
+    currentStandardPpapProjectId = projectId;
+
+    if (pidEl && pidEl.value) {
+        const project = projectList.find((p) => String(p.id) === String(pidEl.value));
+        if (project && Array.isArray(project.tasks) && project.tasks.length > 0) {
+            selectedPPAPItems = getStageTasksFromList(project.tasks, activeStageId);
+        }
+    } else if (currentProject && Array.isArray(currentProject.tasks) && currentProject.tasks.length > 0) {
+        selectedPPAPItems = currentProject.tasks.slice();
+    }
 
     const preservedIds = new Set();
     try {
-        (selectedPPAPItems || []).forEach(i => { if (i && i.id) preservedIds.add(String(i.id)); });
-        if (currentProject && Array.isArray(currentProject.tasks)) currentProject.tasks.forEach(i => { if (i && i.id) preservedIds.add(String(i.id)); });
-        const pidEl = getEl('pt_detail_projectId');
+        (selectedPPAPItems || []).forEach((i) => {
+            if (!i) return;
+            const templateId = getTemplateIdFromTask(i);
+            if (templateId) preservedIds.add(String(templateId));
+        });
+
+        if (currentProject && Array.isArray(currentProject.tasks))
+            currentProject.tasks.forEach((i) => {
+                if (!i) return;
+                const templateId = getTemplateIdFromTask(i);
+                if (templateId) preservedIds.add(String(templateId));
+            });
+
         if (pidEl && pidEl.value) {
-            const project = projectList.find(p => String(p.id) === String(pidEl.value));
-            if (project && Array.isArray(project.tasks)) project.tasks.forEach(i => { if (i && i.id) preservedIds.add(String(i.id)); });
+            const project = projectList.find((p) => String(p.id) === String(pidEl.value));
+            if (project && Array.isArray(project.tasks))
+                project.tasks.forEach((i) => {
+                    if (!i) return;
+                    if (!isTaskInStage(i, activeStageId)) return;
+                    const templateId = getTemplateIdFromTask(i);
+                    if (templateId) preservedIds.add(String(templateId));
+                });
         }
-    } catch (e) { console.warn('Error while computing preserved PPAP ids', e); }
+    } catch (e) {}
 
     let tasks = [];
     try {
-        const res = await fetch('/sample-system/api/tasks/templates');
+        const res = await fetch('/ppap-system/api/tasks/templates');
         if (!res.ok) throw new Error(`Status ${res.status}`);
         const json = await res.json();
-        tasks = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
-        tasks = tasks.map(item => ({
+        tasks = Array.isArray(json.data) ? json.data : Array.isArray(json) ? json : [];
+        tasks = tasks.map((item) => ({
             id: item.id,
             taskCode: item.taskCode || '',
             name: item.name || '',
             description: item.description || '',
             status: item.status || '',
-            priority: item.priority || ''
+            priority: item.priority || '',
         }));
+        allTemplateIds = new Set(tasks.map((t) => String(t.id)));
     } catch (e) {
-        console.warn('Failed to fetch PPAP templates, falling back to local list:', e);
         tasks = standardPPAPTasks;
     }
 
     if (grid) {
-        grid.innerHTML = tasks.map((task) => {
-            const isChecked = preservedIds.has(String(task.id)) ? 'checked' : '';
-            const status = task.status || '';
-            const priority = task.priority || '';
-            return `
-                <div class="ppap-task-card">
-                    <label>
-                        <input type="checkbox" class="ppap-checkbox" value="${task.id}" data-status="${status}" data-priority="${priority}" ${isChecked}>
-                        <div class="ppap-task-info">
-                            <div class="ppap-task-id">${task.taskCode}</div>
-                            <div class="ppap-task-name">${task.name}</div>
-                            <div class="ppap-task-desc">${task.description}</div>
-                        </div>
-                    </label>
-                </div>
-            `;
-        }).join("");
+        const originalTasks = Array.isArray(tasks) ? tasks.slice() : [];
+
+        function renderTaskList(list) {
+            grid.innerHTML = (Array.isArray(list) ? list : [])
+                .map((task) => {
+                    const isChecked = preservedIds.has(String(task.id)) ? 'checked' : '';
+                    const status = task.status || '';
+                    const priority = task.priority || '';
+                    return `
+                    <div class="ppap-task-card">
+                        <label>
+                            <input type="checkbox" class="ppap-checkbox" value="${task.id}" data-status="${status}" data-priority="${priority}" ${isChecked}>
+                            <div class="ppap-task-info">
+                                <div class="ppap-task-id">${task.taskCode}</div>
+                                <div class="ppap-task-name">${task.name}</div>
+                                <div class="ppap-task-desc">${task.description}</div>
+                            </div>
+                        </label>
+                    </div>
+                `;
+                })
+                .join('');
+
+            try {
+                const boxes = grid.querySelectorAll('.ppap-checkbox');
+                boxes.forEach((cb) => cb.addEventListener('change', handlePPAPCheckboxChange));
+            } catch (e) {}
+        }
+
+        renderTaskList(originalTasks);
 
         try {
-            const boxes = grid.querySelectorAll('.ppap-checkbox');
-            boxes.forEach(cb => cb.addEventListener('change', handlePPAPCheckboxChange));
-        } catch (e) {
-            console.warn('Failed to attach PPAP checkbox listeners', e);
-        }
+            const input = document.getElementById('filter-standard-ppap');
+            if (input) {
+                if (input._ppapFilterListener) {
+                    input.removeEventListener('input', input._ppapFilterListener);
+                }
+
+                input.value = '';
+
+                const listener = function (ev) {
+                    const q = ev && ev.target && ev.target.value ? String(ev.target.value).trim().toLowerCase() : '';
+                    if (!q) {
+                        renderTaskList(originalTasks);
+                        return;
+                    }
+
+                    const filtered = originalTasks.filter((t) => {
+                        const n = (t.name || '').toString().toLowerCase();
+                        const d = (t.description || '').toString().toLowerCase();
+                        return n.indexOf(q) !== -1 || d.indexOf(q) !== -1;
+                    });
+                    renderTaskList(filtered);
+                };
+
+                input._ppapFilterListener = listener;
+                input.addEventListener('input', listener);
+            }
+        } catch (e) {}
     }
 
     try {
@@ -1546,7 +5015,7 @@ async function showStandardPPAP() {
 }
 
 function closeStandardPPAP() {
-    var modalEl = document.getElementById("standardPPAPModal");
+    var modalEl = document.getElementById('standardPPAPModal');
     var bsModal = bootstrap.Modal.getInstance(modalEl);
     if (bsModal) bsModal.hide();
 }
@@ -1556,8 +5025,8 @@ function openModalAbove(modalRef) {
     if (!modalEl) return null;
 
     const shown = Array.from(document.querySelectorAll('.modal.show'));
-    let topZ = 1040; // bootstrap default backdrop ~ 1040-1050
-    shown.forEach(m => {
+    let topZ = 1040;
+    shown.forEach((m) => {
         const z = parseInt(window.getComputedStyle(m).zIndex, 10);
         if (!isNaN(z) && z > topZ) topZ = z;
     });
@@ -1566,6 +5035,30 @@ function openModalAbove(modalRef) {
     modalEl.style.zIndex = modalZ;
 
     const bsModal = new bootstrap.Modal(modalEl);
+
+    modalEl.addEventListener('hidden.bs.modal', function cleanupBackdrop() {
+        setTimeout(() => {
+            const backdrops = document.querySelectorAll('.modal-backdrop');
+            const openModals = document.querySelectorAll('.modal.show');
+
+            if (backdrops.length > openModals.length) {
+                for (let i = openModals.length; i < backdrops.length; i++) {
+                    if (backdrops[i] && backdrops[i].parentNode) {
+                        backdrops[i].parentNode.removeChild(backdrops[i]);
+                    }
+                }
+            }
+
+            if (openModals.length === 0) {
+                document.body.classList.remove('modal-open');
+                document.body.style.paddingRight = '';
+                document.body.style.overflow = '';
+            }
+        }, 100);
+
+        modalEl.removeEventListener('hidden.bs.modal', cleanupBackdrop);
+    });
+
     bsModal.show();
 
     setTimeout(() => {
@@ -1580,16 +5073,23 @@ function openModalAbove(modalRef) {
 }
 
 function selectAllPPAP() {
-    document.querySelectorAll(".ppap-checkbox").forEach((cb) => { cb.checked = true; cb.dispatchEvent(new Event('change')); });
+    document.querySelectorAll('.ppap-checkbox').forEach((cb) => {
+        cb.checked = true;
+        cb.dispatchEvent(new Event('change'));
+    });
 }
 
 function deselectAllPPAP() {
-    document.querySelectorAll(".ppap-checkbox").forEach((cb) => { cb.checked = false; cb.dispatchEvent(new Event('change')); });
+    document.querySelectorAll('.ppap-checkbox').forEach((cb) => {
+        cb.checked = false;
+        cb.dispatchEvent(new Event('change'));
+    });
 }
 
 function handlePPAPCheckboxChange(e) {
     const cb = e && e.target ? e.target : null;
     if (!cb) return;
+
     const card = cb.closest('.ppap-task-card');
     const info = card ? card.querySelector('.ppap-task-info') : null;
     const nameEl = info ? info.querySelector('.ppap-task-name') : null;
@@ -1598,56 +5098,55 @@ function handlePPAPCheckboxChange(e) {
     const status = cb.dataset.status || '';
     const priority = cb.dataset.priority || '';
 
+    const map = {};
+    (selectedPPAPItems || []).forEach((i) => {
+        if (i && i.id) map[String(i.id)] = i;
+    });
+
     const item = {
         id: String(cb.value),
         taskCode: codeEl ? codeEl.textContent.trim() : '',
         name: nameEl ? nameEl.textContent.trim() : String(cb.value),
         description: descEl ? descEl.textContent.trim() : '',
         status: status,
-        priority: priority
+        priority: priority,
+        step: Object.keys(map).length + 1,
     };
+    if (currentStandardPpapStageId) {
+        const stageIdInt = parseInt(currentStandardPpapStageId, 10);
+        item.stageId = Number.isNaN(stageIdInt) ? currentStandardPpapStageId : stageIdInt;
+    }
 
     if (cb.checked) {
-        const exists = (selectedPPAPItems || []).some(i => String(i.id) === String(item.id));
-        if (!exists) selectedPPAPItems = (selectedPPAPItems || []).concat([item]);
+        map[String(item.id)] = item;
     } else {
-        selectedPPAPItems = (selectedPPAPItems || []).filter(i => String(i.id) !== String(item.id));
+        delete map[String(item.id)];
     }
 
-    try { renderSelectedTasksInModal(); } catch (err) { console.warn('renderSelectedTasksInModal failed', err); }
+    selectedPPAPItems = Object.values(map);
+
+    selectedPPAPItems.forEach((task, idx) => {
+        if (task) task.step = idx + 1;
+    });
 
     try {
-        const pidEl = getEl('pt_detail_projectId');
-        const projId = pidEl && pidEl.value ? pidEl.value : (currentProject ? currentProject.id : null);
-        if (projId) {
-            const project = projectList.find(p => String(p.id) === String(projId));
-            if (project) {
-                project.tasks = (selectedPPAPItems || []).slice();
-                project.taskCount = project.tasks.length;
-            }
-
-            const container = document.getElementById('projectTasksContent');
-            if (container) renderProjectTasksContent(selectedPPAPItems || [], projId);
-        } else if (currentProject) {
-            currentProject.tasks = (selectedPPAPItems || []).slice();
-            currentProject.taskCount = currentProject.tasks.length;
-            const container = document.getElementById('projectTasksContent');
-            if (container) renderProjectTasksContent(selectedPPAPItems || [], currentProject.id);
-        }
-    } catch (err) {
-        console.warn('Failed to update external project task list after PPAP checkbox change', err);
-    }
+        renderSelectedTasksInModal();
+    } catch (err) {}
 }
 
 function confirmPPAPSelection() {
-    const checked = Array.from(document.querySelectorAll(".ppap-checkbox:checked"));
+    const checked = Array.from(document.querySelectorAll('.ppap-checkbox:checked'));
 
     if (checked.length === 0) {
-        alert("Please select at least one PPAP item");
+        showAlertWarning('Warning', 'Please select at least one PPAP item');
         return;
     }
 
-    const newlySelected = checked.map(cb => {
+    const stageIdRaw = currentStandardPpapStageId;
+    const stageIdInt = stageIdRaw ? parseInt(stageIdRaw, 10) : null;
+    const stageId = !Number.isNaN(stageIdInt) ? stageIdInt : stageIdRaw;
+
+    const selectedTemplateTasks = checked.map((cb) => {
         const card = cb.closest('.ppap-task-card');
         const info = card ? card.querySelector('.ppap-task-info') : null;
         const nameEl = info ? info.querySelector('.ppap-task-name') : null;
@@ -1661,28 +5160,80 @@ function confirmPPAPSelection() {
             name: nameEl ? nameEl.textContent.trim() : cb.value,
             description: descEl ? descEl.textContent.trim() : '',
             status: status,
-            priority: priority
+            priority: priority,
+            isTemplate: true,
+            parentId: String(cb.value),
+            stageId: stageId || null,
         };
     });
 
-    const map = {};
-    selectedPPAPItems.forEach(i => { if (i && i.id) map[String(i.id)] = i; });
-    newlySelected.forEach(i => { if (i && i.id) map[String(i.id)] = i; });
-    selectedPPAPItems = Object.values(map);
+    let existingTasks = [];
+    const pidEl = getEl('pt_detail_projectId');
+    if (pidEl && pidEl.value) {
+        const project = projectList.find((p) => String(p.id) === String(pidEl.value));
+        if (project && Array.isArray(project.tasks)) {
+            existingTasks = project.tasks.slice();
+        }
+    } else if (currentProject && Array.isArray(currentProject.tasks)) {
+        existingTasks = currentProject.tasks.slice();
+    }
 
-    alert(`Selected ${newlySelected.length} PPAP items (Total: ${selectedPPAPItems.length})`);
+    const stageTasks = getStageTasksFromList(existingTasks, stageId);
+    const otherStageTasks = stageId ? existingTasks.filter((t) => !isTaskInStage(t, stageId)) : [];
+
+    const existingTemplateIds = new Set();
+    stageTasks.forEach((t) => {
+        if (!t) return;
+        const templateId = getTemplateIdFromTask(t);
+        if (templateId) existingTemplateIds.add(String(templateId));
+    });
+
+    const newTemplates = selectedTemplateTasks.filter((t) => {
+        const templateId = String(t.id);
+        return !existingTemplateIds.has(templateId);
+    });
+
+    const selectedTemplateIds = new Set(selectedTemplateTasks.map((t) => String(t.id)));
+    const keptStageTasks = stageTasks.filter((t) => {
+        if (!t) return false;
+        const templateId = getTemplateIdFromTask(t);
+        if (templateId) return selectedTemplateIds.has(String(templateId));
+        return true;
+    });
+
+    const mergedStageTasks = [...keptStageTasks, ...newTemplates];
+
+    mergedStageTasks.forEach((task, idx) => {
+        if (task) task.step = idx + 1;
+    });
+
+    const mergedTasks = stageId ? [...otherStageTasks, ...mergedStageTasks] : mergedStageTasks;
+
+    selectedPPAPItems = mergedTasks;
+
+    const addedCount = newTemplates.length;
+    const message =
+        addedCount > 0
+            ? `Added ${addedCount} new PPAP items (total: ${mergedTasks.length} tasks)`
+            : `No new items added (total: ${mergedTasks.length} tasks)`;
+    showAlertSuccess('Success', message);
 
     renderSelectedTasksInModal();
 
     const projectTasksModal = document.getElementById('projectTasksModal');
     if (projectTasksModal && projectTasksModal.classList.contains('show')) {
-        const pidEl = getEl('pt_detail_projectId');
         if (pidEl && pidEl.value) {
-            const project = projectList.find(p => String(p.id) === String(pidEl.value));
+            const project = projectList.find((p) => String(p.id) === String(pidEl.value));
             if (project) {
-                project.tasks = selectedPPAPItems.slice();
-                project.taskCount = selectedPPAPItems.length;
-                renderProjectTasksContent(selectedPPAPItems, project.id);
+                project.tasks = mergedTasks.slice();
+                project.taskCount = mergedTasks.length;
+                setCurrentStageState(project.id, stageId, mergedStageTasks);
+                renderProjectTasksContent(mergedStageTasks, project.id);
+                if (stageId) {
+                    STANDARD_PPAP_STAGE_BY_PROJECT[String(project.id)] = stageId;
+                } else {
+                    delete STANDARD_PPAP_STAGE_BY_PROJECT[String(project.id)];
+                }
             }
         }
     }
@@ -1690,31 +5241,40 @@ function confirmPPAPSelection() {
     closeStandardPPAP();
 
     if (currentProject) {
-        currentProject.tasks = selectedPPAPItems.slice();
-        currentProject.taskCount = selectedPPAPItems.length;
+        currentProject.tasks = mergedTasks.slice();
+        currentProject.taskCount = mergedTasks.length;
     }
 }
 
-
 async function showCustomTask() {
-    var modal = document.getElementById("customTaskModal");
+    var modal = document.getElementById('customTaskModal');
     try {
         await loadCustomTaskSelects();
-        openModalAbove(modal);
+        const bs = openModalAbove(modal);
+        try {
+            setTimeout(() => {
+                initDeadlinePicker();
+                initCustomDriSelect2();
+            }, 60);
+        } catch (e) {}
     } catch (e) {
         console.error(e);
-        try { if (modal) { var mm = new bootstrap.Modal(modal); mm.show(); } } catch(err) { /* ignore */ }
+        try {
+            if (modal) {
+                var mm = new bootstrap.Modal(modal);
+                mm.show();
+            }
+        } catch (err) {}
     }
 }
 
 async function loadCustomTaskSelects() {
     try {
-        const departments = SELECT_CACHE['/api/departments'] || await fetchOptions('/api/departments');
-        const processes = SELECT_CACHE['/api/processes'] || await fetchOptions('/api/processes');
-        const priorities = SELECT_CACHE['/api/tasks/priorities'] || await fetchOptions('/api/tasks/priorities');
-        const stages = SELECT_CACHE['/api/stages'] || await fetchOptions('/api/stages');
+        const departments = SELECT_CACHE['/api/departments'] || (await fetchOptions('/api/departments'));
+        const processes = SELECT_CACHE['/api/processes'] || (await fetchOptions('/api/processes'));
+        const priorities = SELECT_CACHE['/api/tasks/priorities'] || (await fetchOptions('/api/tasks/priorities'));
+        let stages = SELECT_CACHE['/api/stages'] || (await fetchOptions('/api/stages'));
 
-        // write back to cache in case we had to fetch
         SELECT_CACHE['/api/departments'] = departments;
         SELECT_CACHE['/api/processes'] = processes;
         SELECT_CACHE['/api/tasks/priorities'] = priorities;
@@ -1724,248 +5284,995 @@ async function loadCustomTaskSelects() {
         renderOptions('custom-sl-process', processes);
         renderOptions('custom-sl-priority', priorities);
         renderOptions('custom-sl-xvt', stages);
-    } catch (e) {
-        console.warn('loadCustomTaskSelects failed:', e);
-    }
+    } catch (e) {}
 }
 
 function closeCustomTask() {
-    var modalEl = document.getElementById("customTaskModal");
+    var modalEl = document.getElementById('customTaskModal');
     var bsModal = bootstrap.Modal.getInstance(modalEl);
     if (bsModal) bsModal.hide();
 }
 
-
 function showCopyTemplate() {
-    var modal = document.getElementById("copyTemplateModal");
-    try { openModalAbove(modal); } catch (e) { console.error(e); if (modal) { var mm = new bootstrap.Modal(modal); mm.show(); } }
+    var modal = document.getElementById('copyTemplateModal');
+    loadCopyTemplateSelects();
+    try {
+        openModalAbove(modal);
+    } catch (e) {
+        console.error(e);
+        if (modal) {
+            var mm = new bootstrap.Modal(modal);
+            mm.show();
+        }
+    }
+}
+
+async function loadCopyTemplateSelects() {
+    try {
+        const customers = await fetchOptions('/api/customers');
+
+        const sourceCustomerSelect = document.getElementById('source-customer');
+        const targetCustomerSelect = document.getElementById('target-customer');
+
+        if (sourceCustomerSelect && targetCustomerSelect) {
+            const customerOptions =
+                '<option value="">Please select</option>' +
+                customers.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+            sourceCustomerSelect.innerHTML = customerOptions;
+            targetCustomerSelect.innerHTML = customerOptions;
+        }
+
+        const projects = await fetchOptions('/api/projects');
+
+        const sourceProjectSelect = document.getElementById('source-project-number');
+        const targetProjectSelect = document.getElementById('target-project-number');
+
+        if (sourceProjectSelect && targetProjectSelect) {
+            const projectOptions =
+                '<option value="">Please select</option>' +
+                projects.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('');
+            sourceProjectSelect.innerHTML = projectOptions;
+            targetProjectSelect.innerHTML = projectOptions;
+        }
+
+        const stages = await fetchOptions('/api/stages');
+
+        const sourceStageSelect = document.getElementById('source-xvt-stage');
+        const targetStageSelect = document.getElementById('target-xvt-stage');
+
+        if (sourceStageSelect && targetStageSelect) {
+            const stageOptions =
+                '<option value="">Please select</option>' +
+                stages.map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+            sourceStageSelect.innerHTML = stageOptions;
+            targetStageSelect.innerHTML = stageOptions;
+        }
+
+        const processes = await fetchOptions('/api/processes');
+
+        const sourceProcessSelect = document.getElementById('source-process');
+        const targetProcessSelect = document.getElementById('target-process');
+
+        if (sourceProcessSelect && targetProcessSelect) {
+            const processOptions =
+                '<option value="">Please select</option>' +
+                processes.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('');
+            sourceProcessSelect.innerHTML = processOptions;
+            targetProcessSelect.innerHTML = processOptions;
+        }
+    } catch (error) {
+        console.error('Error loading copy template selects:', error);
+        showAlertError('Error', 'Failed to load data for copy template');
+    }
 }
 
 function closeCopyTemplate() {
-    var modalEl = document.getElementById("copyTemplateModal");
+    var modalEl = document.getElementById('copyTemplateModal');
     var bsModal = bootstrap.Modal.getInstance(modalEl);
     if (bsModal) bsModal.hide();
 }
 
+async function confirmCopyProject() {
+    const sourceProjectId = document.getElementById('source-project-number')?.value;
+    const sourceStageId = document.getElementById('source-xvt-stage')?.value;
+    const sourceProcessId = document.getElementById('source-process')?.value;
 
-function showRACIMatrix() {
-    const modal = document.getElementById("raciMatrixModal");
-    const tbody = document.getElementById("raciMatrixBody");
+    const targetProjectId = document.getElementById('target-project-number')?.value;
+    const targetStageId = document.getElementById('target-xvt-stage')?.value;
+    const targetProcessId = document.getElementById('target-process')?.value;
 
-    tbody.innerHTML = raciMatrixData.map((row) => `
-        <tr>
-            <td>${row.task}</td>
-            ${Object.entries(row.departments).map(([dept, role]) => `
-                <td><span class="raci-cell raci-badge raci-${role.toLowerCase()}">${role}</span></td>
-            `).join("")}
-        </tr>
-    `).join("");
+    if (
+        !sourceProjectId ||
+        !sourceStageId ||
+        !sourceProcessId ||
+        !targetProjectId ||
+        !targetStageId ||
+        !targetProcessId
+    ) {
+        showAlertWarning('Warning', 'Please fill in all required fields');
+        return;
+    }
 
     try {
-        var bsModal = new bootstrap.Modal(modal);
+        const params = new URLSearchParams({
+            sourceId: sourceProjectId,
+            sourceProcessId: sourceStageId,
+            sourceStageId: sourceProcessId,
+            targetId: targetProjectId,
+            targetProcessId: targetStageId,
+            targetStageId: targetProcessId,
+        });
+
+        const response = await fetch(`/ppap-system/api/projects/copy?${params.toString()}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+        });
+
+        if (!response.ok) {
+            const message = await getApiErrorMessage(response, `Failed to copy project (${response.status})`);
+            throw new Error(message);
+        }
+
+        const result = await response.json();
+
+        showAlertSuccess('Success', 'Project copied successfully');
+        closeCopyTemplate();
+
+        await loadProjectList();
+    } catch (error) {
+        console.error('Error copying project:', error);
+        showAlertError('Error', error && error.message ? error.message : 'Failed to copy project');
+    }
+}
+
+function showRACIMatrix(projectId) {
+    showRACIMatrixForProject(projectId);
+}
+
+function showRACIMatrixFromProject() {
+    const projectIdEl = document.getElementById('pt_detail_projectId');
+    if (!projectIdEl || !projectIdEl.value) {
+        showAlertError('Error', 'Project ID not found');
+        return;
+    }
+    showRACIMatrixForProject(projectIdEl.value);
+}
+
+let currentRACIData = {};
+let currentRACIProjectId = null;
+let currentRACISelection = '';
+const RACI_EMPTY_PLACEHOLDER = '<span class="raci-cell raci-empty"></span>';
+
+function initRaciSelection(defaultValue = '') {
+    const select = document.getElementById('raci-selection');
+    if (!select) return;
+
+    currentRACISelection = defaultValue || select.value || '';
+
+    if (select._raciChangeHandler) {
+        select.removeEventListener('change', select._raciChangeHandler);
+    }
+
+    const handler = (ev) => {
+        currentRACISelection = ev.target.value || '';
+    };
+
+    select._raciChangeHandler = handler;
+    select.value = currentRACISelection;
+    select.addEventListener('change', handler);
+}
+
+async function loadRACIMatrixData(projectId) {
+    const modal = document.getElementById('raciMatrixModal');
+    const theadRow = modal.querySelector('thead tr');
+    const tbody = document.getElementById('raciMatrixBody');
+
+    currentRACIProjectId = projectId;
+
+    const project = findProjectById(projectId);
+    const projectName = project ? project.name : '';
+
+    const modalTitle = modal.querySelector('#raciMatrixModalLabel span:last-child');
+    if (modalTitle) {
+        const originalText = modalTitle.textContent.split(' - ')[0];
+        if (projectName) {
+            modalTitle.textContent = `${originalText} - ${projectName}`;
+        } else {
+            modalTitle.textContent = originalText;
+        }
+    }
+
+    const departments = SELECT_CACHE['/api/departments'] || [];
+    if (departments.length === 0) {
+        const deptRes = await fetch('/ppap-system/api/departments');
+        if (deptRes.ok) {
+            const deptJson = await deptRes.json();
+            SELECT_CACHE['/api/departments'] = deptJson.data || [];
+            departments.push(...SELECT_CACHE['/api/departments']);
+        }
+    }
+
+    const tasksRes = await fetch(`/ppap-system/api/project/${projectId}/tasks`);
+    if (!tasksRes.ok) {
+        throw new Error(`Failed to fetch tasks: ${tasksRes.status}`);
+    }
+    const tasksJson = await tasksRes.json();
+    const tasks = tasksJson.data || [];
+
+    const raciRes = await fetch(`/ppap-system/api/project/${projectId}/task-raci`);
+    if (!raciRes.ok) {
+        throw new Error(`Failed to fetch RACI data: ${raciRes.status}`);
+    }
+    const raciJson = await raciRes.json();
+    const raciData = raciJson.data || [];
+
+    currentRACIData = {};
+    raciData.forEach((raci) => {
+        const key = `${raci.taskId}_${raci.departmentId}`;
+        currentRACIData[key] = {
+            id: raci.id,
+            raci: raci.raci || '',
+            taskId: raci.taskId,
+            departmentId: raci.departmentId,
+        };
+    });
+
+    if (theadRow) {
+        theadRow.innerHTML = `
+            <th style="min-width: 150px;position:sticky">Task</th>
+            ${departments.map((dept) => `<th style="max-width: 80px">${dept.name || dept.id}</th>`).join('')}
+        `;
+    }
+
+    tbody.innerHTML = tasks
+        .map((task) => {
+            return `
+            <tr>
+                <td>${task.name || task.id}</td>
+                ${departments
+                    .map((dept) => {
+                        const key = `${task.id}_${dept.id}`;
+                        const raciObj = currentRACIData[key];
+                        const raciValue = raciObj ? raciObj.raci : '';
+
+                        return `<td class="raci-editable-cell" data-task-id="${task.id}" data-dept-id="${
+                            dept.id
+                        }" style="cursor: pointer; min-height: 40px; vertical-align: middle;">
+                            ${
+                                raciValue
+                                    ? `<span class="raci-cell raci-badge raci-${raciValue.toLowerCase()}">${raciValue}</span>`
+                                    : RACI_EMPTY_PLACEHOLDER
+                            }
+                        </td>`;
+                    })
+                    .join('')}
+            </tr>
+        `;
+        })
+        .join('');
+
+    tbody.querySelectorAll('.raci-editable-cell').forEach((cell) => {
+        cell.addEventListener('click', handleRACICellClick);
+    });
+}
+
+async function showRACIMatrixForProject(projectId) {
+    if (!projectId || projectId === 'null' || projectId === 'undefined') {
+        showAlertWarning('Warning', 'Invalid project ID');
+        return;
+    }
+
+    const modal = document.getElementById('raciMatrixModal');
+
+    try {
+        loader.load();
+
+        await loadRACIMatrixData(projectId);
+
+        loader.unload();
+
+        const existingModals = document.querySelectorAll('.modal.show');
+        let maxZ = 1040;
+
+        existingModals.forEach((m) => {
+            const z = parseInt(window.getComputedStyle(m).zIndex || '1040', 10);
+            if (z > maxZ) maxZ = z;
+        });
+
+        const newModalZ = maxZ + 20;
+        const newBackdropZ = maxZ + 10;
+
+        modal.style.zIndex = newModalZ;
+
+        const bsModal = new bootstrap.Modal(modal, {
+            backdrop: 'static',
+            keyboard: true,
+        });
+
         bsModal.show();
+        currentRACISelection = '';
+        initRaciSelection('');
+
+        setTimeout(() => {
+            const backdrops = document.querySelectorAll('.modal-backdrop');
+            if (backdrops.length > 0) {
+                const lastBackdrop = backdrops[backdrops.length - 1];
+                lastBackdrop.style.zIndex = newBackdropZ;
+            }
+        }, 50);
     } catch (e) {
-        console.error('Bootstrap Modal show error:', e);
-        modal.classList.add("active");
+        loader.unload();
+        console.error('Error showing RACI Matrix:', e);
+        showAlertError('Error', 'Failed to load RACI Matrix: ' + (e.message || e));
+    }
+}
+
+function handleRACICellClick(e) {
+    const cell = e.currentTarget;
+    const taskId = cell.dataset.taskId;
+    const deptId = cell.dataset.deptId;
+    const key = `${taskId}_${deptId}`;
+
+    const selectEl = document.getElementById('raci-selection');
+    const selectedRaci = selectEl ? selectEl.value : currentRACISelection;
+
+    if (selectedRaci === undefined || selectedRaci === null) {
+        return;
+    }
+
+    const nextRaci = selectedRaci;
+
+    if (!currentRACIData[key]) {
+        currentRACIData[key] = {
+            taskId: parseInt(taskId),
+            departmentId: parseInt(deptId),
+            raci: nextRaci,
+        };
+    } else {
+        currentRACIData[key].raci = nextRaci;
+    }
+
+    if (nextRaci) {
+        cell.innerHTML = `<span class="raci-cell raci-badge raci-${nextRaci.toLowerCase()}">${nextRaci}</span>`;
+    } else {
+        cell.innerHTML = RACI_EMPTY_PLACEHOLDER;
     }
 }
 
 function closeRACIMatrix() {
     try {
-        var modalEl = document.getElementById("raciMatrixModal");
+        var modalEl = document.getElementById('raciMatrixModal');
         var instance = bootstrap.Modal.getInstance(modalEl);
         if (instance) instance.hide();
-        else modalEl.classList.remove("active");
+        else modalEl.classList.remove('active');
     } catch (e) {
         console.error('Bootstrap Modal hide error:', e);
-        document.getElementById("raciMatrixModal").classList.remove("active");
+        document.getElementById('raciMatrixModal').classList.remove('active');
     }
 }
 
-function approveProject(projectId) {
-    if (!confirm('Are you sure you want to approve this project?')) return;
-
-    const project = projectList.find(p => p.id === projectId);
-    if (project) {
-        project.status = 'approved'; // Đổi thành 'approved'
-        project.approvedDate = new Date().toISOString().split('T')[0];
-
-
-
-        loadProjectList();
-    }
-}
-
-
-function rejectProject(projectId) {
-    const reason = prompt('Please enter the rejection reason:');
-    if (!reason) return;
-
-    if (!confirm(`Are you sure you want to reject this project?\nReason: ${reason}`)) return;
-
-    const project = projectList.find(p => p.id === projectId);
-    if (project) {
-        project.status = 'rejected';
-        project.rejectedDate = new Date().toISOString().split('T')[0];
-        project.rejectReason = reason;
-
-
-        alert(`Project "${project.name}" has been rejected\nIt will be moved to the All Projects list (rejected status)`);
-
-        loadProjectList();
-    }
-}
-
-
-
-async function deleteProject(projectId) {
-    const project = projectList.find(p => String(p.id) === String(projectId));
-    if (!project) {
-        console.warn('deleteProject: project not found for id', projectId);
-        alert('Project not found');
+function saveRACIMatrix() {
+    if (!currentRACIProjectId) {
+        showAlertError('Error', 'Project ID not found');
         return;
     }
 
-    if (!confirm(`Are you sure you want to delete project "${project.name}"?\nThis action cannot be undone!`)) {
-        return;
-    }
     try {
-        const bodyId = parseInt(projectId, 10);
-        if (isNaN(bodyId)) {
-            alert('Cannot delete temporary project. Please save it first.');
+        loader.load();
+        const raciItems = [];
+        Object.values(currentRACIData).forEach((item) => {
+            if (!item) return;
+
+            const v = (item.raci ?? '').trim();
+
+            if (v !== '') {
+                const raciItem = {
+                departmentId: item.departmentId,
+                taskId: item.taskId,
+                raci: v,
+                flag: null,
+                };
+            if (item.id) raciItem.id = item.id;
+            raciItems.push(raciItem);
+            return;
+            }
+
+            if (item.id) {
+                raciItems.push({
+                id: item.id,
+                departmentId: item.departmentId,
+                taskId: item.taskId,
+                raci: '',
+                flag: null,
+                });
+            }
+        });
+
+        fetch('/ppap-system/api/task-raci/update', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(raciItems),
+        })
+            .then((response) => {
+                if (!response.ok) {
+                    throw new Error(`Failed to save RACI: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(async (result) => {
+                showAlertSuccess('Success', 'RACI Matrix saved successfully');
+                await loadRACIMatrixData(currentRACIProjectId);
+                loader.unload();
+            })
+            .catch((error) => {
+                loader.unload();
+                console.error('Error saving RACI Matrix:', error);
+                showAlertError('Error', 'Failed to save RACI Matrix: ' + (error.message || error));
+            });
+    } catch (e) {
+        loader.unload();
+        console.error('Error in saveRACIMatrix:', e);
+        showAlertError('Error', 'Failed to save RACI Matrix');
+    }
+}
+
+async function approveProject(projectId) {
+    const result = await Swal.fire({
+        title: 'Approve Project',
+        text: 'Are you sure you want to approve this project?',
+        icon: 'question',
+        showCancelButton: true,
+        confirmButtonText: 'Approve',
+        cancelButtonText: 'Cancel',
+    });
+
+    if (!result.isConfirmed) return;
+
+    try {
+        const res = await fetch('/ppap-system/api/projects/approve?id=' + encodeURIComponent(projectId), {
+            method: 'POST',
+        });
+
+        if (!res.ok) {
+            const message = await getApiErrorMessage(res, `Approve API returned ${res.status}`);
+            showAlertError('Failed', message);
             return;
         }
 
-        const url = `/sample-system/api/projects/delete?id=${encodeURIComponent(bodyId)}`;
-        const res = await fetch(url, { method: 'POST' });
+        showAlertSuccess('Approved', 'Project approved successfully');
+        const project = projectList.find((p) => String(p.id) === String(projectId));
+        if (project) project.status = 'approved';
+        await loadProjectList();
+        try {
+            if (
+                document.getElementById('projectTasksModal') &&
+                bootstrap.Modal.getInstance(document.getElementById('projectTasksModal'))
+            )
+                bootstrap.Modal.getInstance(document.getElementById('projectTasksModal')).hide();
+        } catch (e) {}
+    } catch (e) {
+        console.error('Approve API error', e);
+        showAlertError('Failed', 'Failed to call approve API: ' + (e && e.message ? e.message : e));
+    }
+}
+
+async function rejectProject(projectId) {
+    const result = await Swal.fire({
+        title: 'Reject Project',
+        text: 'Are you sure you want to reject this project?',
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Reject',
+        cancelButtonText: 'Cancel',
+        confirmButtonColor: '#dc3545',
+    });
+
+    if (!result.isConfirmed) return;
+
+    try {
+        const res = await fetch('/ppap-system/api/projects/return?id=' + encodeURIComponent(projectId), {
+            method: 'POST',
+        });
+
+        if (!res.ok) {
+            const message = await getApiErrorMessage(res, `Return API returned ${res.status}`);
+            showAlertError('Failed', message);
+            return;
+        }
+
+        showAlertWarning('Rejected', 'Project has been returned/rejected');
+        const project = projectList.find((p) => String(p.id) === String(projectId));
+        if (project) project.status = 'rejected';
+        await loadProjectList();
+        try {
+            if (
+                document.getElementById('projectTasksModal') &&
+                bootstrap.Modal.getInstance(document.getElementById('projectTasksModal'))
+            )
+                bootstrap.Modal.getInstance(document.getElementById('projectTasksModal')).hide();
+        } catch (e) {}
+    } catch (e) {
+        console.error('Return API error', e);
+        showAlertError('Failed', 'Failed to call return API: ' + (e && e.message ? e.message : e));
+    }
+}
+
+async function deleteProject(projectId) {
+    const project = projectList.find((p) => String(p.id) === String(projectId));
+    if (!project) {
+        return;
+    }
+
+    const confirmation = await Swal.fire({
+        title: 'Delete Project',
+        text: `Delete project "${project.name}"? This action cannot be undone.`,
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Delete',
+        cancelButtonText: 'Cancel',
+        confirmButtonColor: '#dc3545',
+    });
+
+    if (!confirmation.isConfirmed) return;
+
+    try {
+        const bodyId = parseInt(projectId, 10);
+        if (isNaN(bodyId)) {
+            return;
+        }
+
+        const url = `/ppap-system/api/projects/delete?id=${encodeURIComponent(bodyId)}`;
+        const res = await fetch(url, {method: 'POST'});
 
         console.debug('deleteProject: response status', res.status, res.statusText);
 
         if (!res.ok) {
-            const text = await res.text().catch(() => '');
-            throw new Error(`Delete failed (${res.status}): ${text}`);
+            const message = await getApiErrorMessage(res, `Delete failed (${res.status})`);
+            throw new Error(message);
         }
 
         let ok = true;
+        let json = null;
         try {
-            const json = await res.json();
+            json = await res.json();
             console.debug('deleteProject: response json', json);
             if (json && (json.status === 'ERROR' || json.success === false)) ok = false;
-        } catch (e) { /* ignore parse errors */ }
+        } catch (e) {}
 
         if (!ok) {
+            const message = extractApiMessage(json) || 'Server reported failure when deleting project.';
+            showAlertError('Failed', message);
             return;
         }
 
-        projectList = projectList.filter(p => String(p.id) !== String(projectId));
-        console.log('🗑️ Project deleted:', projectId);
-        alert(`Project "${project.name}" has been deleted`);
+        projectList = projectList.filter((p) => String(p.id) !== String(projectId));
+        showAlertSuccess('Success', `Project "${project.name}" has been deleted`);
         await loadProjectList();
-
     } catch (e) {
         console.error('Failed to delete project:', e);
-        alert('Failed to delete project. Please try again.');
+        showAlertError('Failed', e && e.message ? e.message : 'Failed to delete project. Please try again.');
     }
 }
-
-function editProject(projectId) {
-    console.log('Edit project:', projectId);
-}
-
-// ===================================
-// EXPORT TO GLOBAL SCOPE
-// ===================================
-window.showCreateProjectForm = showCreateProjectForm;
-window.cancelCreateProject = cancelCreateProject;
-window.saveProjectBasicInfo = saveProjectBasicInfo;
-window.cancelProjectCreation = cancelProjectCreation;
-window.submitProject = submitProject;
-window.showStandardPPAP = showStandardPPAP;
-window.closeStandardPPAP = closeStandardPPAP;
-window.selectAllPPAP = selectAllPPAP;
-window.deselectAllPPAP = deselectAllPPAP;
-window.confirmPPAPSelection = confirmPPAPSelection;
-window.showCustomTask = showCustomTask;
-window.closeCustomTask = closeCustomTask;
-window.showCopyTemplate = showCopyTemplate;
-window.closeCopyTemplate = closeCopyTemplate;
-window.showRACIMatrix = showRACIMatrix;
-window.closeRACIMatrix = closeRACIMatrix;
-window.approveProject = approveProject;
-window.rejectProject = rejectProject;
-window.editProject = editProject;
-window.deleteProject = deleteProject;
-window.createProject = createProject;
-window.saveProjectBasicInfoModal = saveProjectBasicInfoModal;
-window.createModalBackToStep1 = createModalBackToStep1;
-window.closeCreateProjectModal = closeCreateProjectModal;
-window.submitProjectFromModal = submitProjectFromModal;
-window.renderSelectedTasksInModal = renderSelectedTasksInModal;
-window.removeSelectedTask = removeSelectedTask;
-window.initSelectedTasksDragAndDrop = initSelectedTasksDragAndDrop;
-window.handleTaskDrop = handleTaskDrop;
-window.handleTaskDragStart = handleTaskDragStart;
-window.showAddTaskModal = showAddTaskModal;
-window.saveProjectTaskQuantity = saveProjectTaskQuantity;
-window.removeTaskFromProject = removeTaskFromProject;
 
 function initDeadlinePicker() {
-    const el = document.getElementById('deadLine');
-    if (!el) return;
+    const ids = ['deadLine', 'custom-deadline'];
 
-    if (window.jQuery && typeof window.jQuery.fn.daterangepicker === 'function') {
-        try { el.type = 'text'; } catch (e) {}
+    ids.forEach((id) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const withTime = id === 'deadLine';
 
-        $(el).daterangepicker({
-            singleDatePicker: true,
-            timePicker: true,
-            timePicker24Hour: true,
-            showDropdowns: true,
-            autoUpdateInput: false,
-            opens: 'right',
-            locale: { format: 'YYYY-MM-DD HH:mm' }
-        });
-
-        $(el).on('apply.daterangepicker', function (ev, picker) {
-            $(this).val(picker.startDate.format('YYYY-MM-DD HH:mm'));
-        });
-
-        $(el).on('cancel.daterangepicker', function () {
-        });
-
-        return;
-    }
-
-    if (typeof flatpickr === 'function') {
         try {
-            try { el.type = 'text'; } catch (e) {}
-            flatpickr(el, {
-                enableTime: true,
-                time_24hr: true,
-                dateFormat: 'Y-m-d H:i',
-                allowInput: true,
-                clickOpens: true,
-                onClose: function(selectedDates) {
-                    if (selectedDates && selectedDates[0]) {
-                        // ensure formatted value
-                        el.value = flatpickr.formatDate(selectedDates[0], 'Y-m-d H:i');
-                    }
+            const raw = String(el.value || '').trim();
+            if (raw === '-' || raw.toUpperCase() === 'N/A') el.value = '';
+        } catch (e) {}
+
+        try {
+            if (window.jQuery && $(el).data('daterangepicker')) {
+                try {
+                    $(el).data('daterangepicker').remove();
+                } catch (err) {}
+                try {
+                    $(el).off('apply.daterangepicker cancel.daterangepicker');
+                } catch (err) {}
+            }
+        } catch (e) {}
+
+        try {
+            if (el._flatpickr) {
+                try {
+                    el._flatpickr.destroy();
+                } catch (err) {}
+            }
+        } catch (e) {}
+
+        if (window.jQuery && typeof window.jQuery.fn.daterangepicker === 'function') {
+            try {
+                el.type = 'text';
+            } catch (e) {}
+
+            const currentValue = el.value || '';
+            singlePicker($(el), currentValue, withTime);
+
+            $(el).on('apply.daterangepicker', function (ev, picker) {
+                try {
+                    $(this).val(picker.startDate.format(withTime ? 'YYYY/MM/DD HH:mm:ss' : 'YYYY/MM/DD'));
+                } catch (err) {
+                    $(this).val('');
                 }
             });
-            return;
-        } catch (e) {
-            console.warn('flatpickr init failed for #deadLine', e);
-        }
-    }
 
-    el.addEventListener('focus', function onFocus() {
+            $(el).on('cancel.daterangepicker', function () {
+                try {
+                    $(this).val('');
+                } catch (err) {}
+            });
+
+            return;
+        }
+
         try {
-            el.type = 'datetime-local';
+            el.type = withTime ? 'datetime-local' : 'date';
         } catch (e) {}
-        el.removeEventListener('focus', onFocus);
     });
 }
 
-document.addEventListener('DOMContentLoaded', function () {
-    try { initDeadlinePicker(); } catch (e) {  }
+function getProjectIdFromLocation() {
+    try {
+        const params = new URLSearchParams(window.location.search || '');
+        const qProjectId = params.get('projectId');
+        if (qProjectId) return qProjectId;
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function getTaskIdFromLocation() {
+    try {
+        const params = new URLSearchParams(window.location.search || '');
+        const qTaskId = params.get('taskId');
+        if (qTaskId) return qTaskId;
+
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function urlProject() {
+    const projectId = getProjectIdFromLocation();
+    if (!projectId) return;
+
+    try {
+        let retries = 0;
+        const maxRetries = 20;
+
+        while ((!projectList || projectList.length === 0) && retries < maxRetries) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            retries++;
+        }
+
+        const project = findProjectById(projectId);
+        if (!project) {
+            return;
+        }
+
+        await showProjectTasksModal(projectId);
+    } catch (e) {
+        console.error('urlProject error:', e);
+    }
+}
+
+async function urlTask() {
+    const taskId = getTaskIdFromLocation();
+    if (!taskId) return;
+
+    try {
+        let retries = 0;
+        const maxRetries = 20;
+
+        while ((!projectList || projectList.length === 0) && retries < maxRetries) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            retries++;
+        }
+
+        const res = await fetch(`/ppap-system/api/tasks/${encodeURIComponent(taskId)}`);
+        if (!res.ok) {
+            await showTaskDetailModal(null, taskId);
+            return;
+        }
+
+        const json = await res.json();
+        const task = json.data || json.result || null;
+
+        if (!task) {
+            await showTaskDetailModal(null, taskId);
+            return;
+        }
+
+        const projectId = task.projectId || task.project_id || task.project_id_fk || null;
+
+        await showTaskDetailModal(projectId, taskId);
+    } catch (e) {
+        console.error('urlTask error:', e);
+        try {
+            await showTaskDetailModal(null, taskId);
+        } catch (err) {
+            console.error('Fallback showTaskDetailModal failed', err);
+        }
+    }
+}
+
+function debounce(fn, wait) {
+    let timeout = null;
+    return function () {
+        const args = arguments;
+        const later = () => {
+            timeout = null;
+            fn.apply(this, args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+function filterProjectTasksByName(query) {
+    try {
+        const table = document.getElementById('projectTasksTable');
+        if (!table) return;
+        const tbody = table.querySelector('tbody');
+        if (!tbody) return;
+
+        const q = (query || '').trim().toLowerCase();
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+
+        if (!q) {
+            rows.forEach((r) => {
+                r.style.display = '';
+            });
+            return;
+        }
+
+        rows.forEach((row) => {
+            const cells = row.querySelectorAll('td');
+            const taskNumberCell = cells && cells.length >= 3 ? cells[2] : null;
+            const taskNameCell = cells && cells.length >= 4 ? cells[3] : null;
+            const numberText = taskNumberCell
+                ? (taskNumberCell.textContent || taskNumberCell.innerText || '').trim().toLowerCase()
+                : '';
+            const nameText = taskNameCell
+                ? (taskNameCell.textContent || taskNameCell.innerText || '').trim().toLowerCase()
+                : '';
+            if (numberText.indexOf(q) === -1 && nameText.indexOf(q) === -1) {
+                row.style.display = 'none';
+            } else {
+                row.style.display = '';
+            }
+        });
+    } catch (e) {}
+}
+
+document.addEventListener('DOMContentLoaded', async function () {
+    const btn = document.getElementById('upload');
+    if (btn) {
+        btn.addEventListener('click', handleTaskFileUpload);
+    }
+
+    try {
+        if (window.jQuery && typeof window.jQuery.fn.daterangepicker === 'function') {
+            var input = document.querySelector('#filter-created-date');
+            if (input) {
+                try {
+                    if ($(input).data('daterangepicker')) {
+                        try {
+                            $(input).data('daterangepicker').remove();
+                        } catch (err) {}
+                        try {
+                            $(input).off('apply.daterangepicker cancel.daterangepicker');
+                        } catch (err) {}
+                    }
+                } catch (err) {}
+
+                rangePicker($(input), null, null);
+
+                $(input).on('apply.daterangepicker', function (ev, picker) {
+                    try {
+                        $(this).val(
+                            picker.startDate.format('YYYY/MM/DD') + ' - ' + picker.endDate.format('YYYY/MM/DD')
+                        );
+                        $(this).trigger('change');
+                    } catch (err) {}
+                });
+
+                $(input).on('cancel.daterangepicker', function () {
+                    try {
+                        $(this).val('');
+                        $(this).trigger('change');
+                    } catch (err) {}
+                });
+            }
+        }
+    } catch (e) {}
+
+    const btnComment = document.getElementById('comment');
+    if (btnComment) {
+        btnComment.addEventListener('click', handleTaskComment);
+    }
+
+    const btnAddCustom = document.getElementById('add-custom');
+    if (btnAddCustom) {
+        btnAddCustom.addEventListener('click', handleAddCustomTask);
+    }
+
+    const newProjectCustomer = document.getElementById('newProjectCustomer');
+    if (newProjectCustomer) {
+        newProjectCustomer.addEventListener('change', function (ev) {
+            try {
+                loadCftTeamsForSelect('newProjectCft', ev.target.value);
+            } catch (e) {}
+        });
+    }
+
+    const filterCustomer = document.getElementById('projectCustomerSelect');
+    if (filterCustomer) {
+        filterCustomer.addEventListener('change', function (ev) {
+            try {
+                loadCftTeamsForSelect('sl-cft', ev.target.value);
+            } catch (e) {}
+        });
+    }
+
+    try {
+        const searchInput = document.getElementById('search-task');
+        if (searchInput) {
+            if (searchInput._searchHandler) {
+                searchInput.removeEventListener('input', searchInput._searchHandler);
+            }
+
+            searchInput._searchHandler = debounce(function (ev) {
+                try {
+                    filterProjectTasksByName(ev.target.value);
+                } catch (e) {}
+            }, 200);
+
+            searchInput.addEventListener('input', searchInput._searchHandler);
+        }
+    } catch (e) {}
+
+    try {
+        const addStageBtn = document.getElementById('add-stage-btn');
+        if (addStageBtn) {
+            addStageBtn.addEventListener('click', function () {
+                const modalEl = document.getElementById('createStageModal');
+                if (!modalEl) return;
+                const input = modalEl.querySelector('#new-stage-name');
+                if (input) input.value = '';
+                openModalAbove(modalEl);
+            });
+        }
+
+        const confirmCreateStage = document.getElementById('confirm-create-stage');
+        if (confirmCreateStage) {
+            confirmCreateStage.addEventListener('click', function () {
+                handleCreateStageConfirm();
+            });
+        }
+
+        const newStageInput = document.getElementById('new-stage-name');
+        if (newStageInput) {
+            newStageInput.addEventListener('keydown', function (ev) {
+                if (ev.key === 'Enter') {
+                    ev.preventDefault();
+                    handleCreateStageConfirm();
+                }
+            });
+        }
+
+        const stageTabs = document.getElementById('projectStageTabs');
+        if (stageTabs) {
+            stageTabs.addEventListener('click', function (ev) {
+                const btn = ev.target.closest('.stage-tab');
+                if (!btn) return;
+                const stageId = btn.dataset.stageId;
+                const projectId = document.getElementById('pt_detail_projectId')?.value;
+                if (!projectId) return;
+                loadProjectTasksByStage(projectId, stageId);
+            });
+        }
+    } catch (e) {}
+
+    await loadAllSelects();
+    await loadUsersAndInitDriSelects();
+    initCommentMentionAutocomplete();
+    await loadProjectList();
+
+    try {
+        initDeadlinePicker();
+    } catch (e) {}
+
+    try {
+        const taskId = getTaskIdFromLocation();
+        if (taskId) {
+            await urlTask();
+        } else {
+            await urlProject();
+        }
+    } catch (e) {}
+
+    const modalEl = document.getElementById('taskDetailModal');
+    if (modalEl) {
+        modalEl.addEventListener('hidden.bs.modal', function () {
+            try {
+                const url = new URL(window.location.href);
+                url.searchParams.delete('taskId');
+                window.history.pushState({}, '', url.toString());
+            } catch (e) {}
+        });
+    }
+
+    const projectModalEl = document.getElementById('projectTasksModal');
+    if (projectModalEl) {
+        projectModalEl.addEventListener('hidden.bs.modal', function () {
+            try {
+                const url = new URL(window.location.href);
+                url.searchParams.delete('projectId');
+                window.history.pushState({}, '', url.toString());
+            } catch (e) {}
+        });
+    }
+
+    try {
+        const fb = document.getElementById('filter_button');
+        if (fb)
+            fb.addEventListener('click', function (ev) {
+                try {
+                    filterProjects();
+                } catch (e) {}
+            });
+
+        try {
+            const clearBtn = document.getElementById('clear_filter_button');
+            if (clearBtn)
+                clearBtn.addEventListener('click', function (ev) {
+                    try {
+                        clearAdvancedFilters();
+                    } catch (e) {}
+                });
+        } catch (e) {}
+
+        try {
+            const projectSearchInput = document.getElementById('ppapFilterProject');
+            if (projectSearchInput) {
+                const handler = function (ev) {
+                    if (ev && ev.key === 'Enter') {
+                        ev.preventDefault();
+                        try {
+                            filterProjects();
+                        } catch (error) {}
+                    }
+                };
+                projectSearchInput.addEventListener('keydown', handler);
+            }
+        } catch (e) {}
+
+        try {
+            const modelFilterInput = document.getElementById('filter-model');
+            if (modelFilterInput) {
+                const handler = function (ev) {
+                    if (ev && ev.key === 'Enter') {
+                        ev.preventDefault();
+                        try {
+                            filterProjects();
+                        } catch (error) {}
+                    }
+                };
+                modelFilterInput.addEventListener('keydown', handler);
+            }
+        } catch (e) {}
+    } catch (e) {}
 });
